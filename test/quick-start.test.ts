@@ -79,6 +79,25 @@ describe('Quick Start API', () => {
       expect(existsSync(casePath)).toBe(true);
     });
 
+    it('should preserve a provided session name', async () => {
+      const testCaseName = 'test-named-quick-start-' + Date.now();
+      const sessionName = `w1-${testCaseName}`;
+      createdCases.push(testCaseName);
+
+      const response = await fetch(`${baseUrl}/api/quick-start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ caseName: testCaseName, name: sessionName }),
+      });
+
+      const data = await response.json();
+      expect(data.success).toBe(true);
+
+      const detailResponse = await fetch(`${baseUrl}/api/sessions/${data.data.sessionId}`);
+      const detail = await detailResponse.json();
+      expect(detail.data.name).toBe(sessionName);
+    });
+
     it('should reject invalid case names with special characters', async () => {
       const response = await fetch(`${baseUrl}/api/quick-start`, {
         method: 'POST',

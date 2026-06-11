@@ -790,6 +790,20 @@ describe('session-routes', () => {
               },
             }),
             JSON.stringify({
+              timestamp: '2026-06-11T14:03:29.745Z',
+              type: 'response_item',
+              payload: {
+                type: 'message',
+                role: 'user',
+                content: [
+                  {
+                    type: 'input_text',
+                    text: '# AGENTS.md instructions for /mnt/d/AI\n\n<INSTRUCTIONS>\n# CODEX WORKFLOW\n</INSTRUCTIONS>\n\n<environment_context>\n  <cwd>/mnt/d/AI</cwd>\n</environment_context>',
+                  },
+                ],
+              },
+            }),
+            JSON.stringify({
               timestamp: '2026-06-11T14:03:29.754Z',
               type: 'event_msg',
               payload: { type: 'user_message', message: 'normal-use powershell codex' },
@@ -812,6 +826,57 @@ describe('session-routes', () => {
             sizeBytes: expect.any(Number),
             lastModified: expect.any(String),
             firstPrompt: 'normal-use powershell codex',
+          }),
+        ]);
+      } finally {
+        if (previousCodexHome === undefined) {
+          delete process.env.CODEX_HOME;
+        } else {
+          process.env.CODEX_HOME = previousCodexHome;
+        }
+        await rm(codexHome, { recursive: true, force: true });
+      }
+    });
+
+    it('cleans Happy/Codex injected option wrapper from history prompts', async () => {
+      const previousCodexHome = process.env.CODEX_HOME;
+      const codexHome = await mkdtemp(join(tmpdir(), 'codeman-codex-home-'));
+      try {
+        process.env.CODEX_HOME = codexHome;
+        const sessionDir = join(codexHome, 'sessions', '2026', '06', '12');
+        await mkdir(sessionDir, { recursive: true });
+        const sessionId = '019eb761-fba4-76b1-8dfe-d8a65a390dea';
+        await writeFile(
+          join(sessionDir, `rollout-2026-06-12T00-05-00-${sessionId}.jsonl`),
+          [
+            JSON.stringify({
+              timestamp: '2026-06-11T14:05:00.000Z',
+              type: 'session_meta',
+              payload: { id: sessionId, cwd: '/mnt/d/AI/文档' },
+            }),
+            JSON.stringify({
+              timestamp: '2026-06-11T14:05:00.100Z',
+              type: 'event_msg',
+              payload: {
+                type: 'user_message',
+                message:
+                  '# Options\n\nYou have a way to give a user a easy way to answer your questions if you know possible answers.\n\n# Plan mode with options\n\nWhen you are in the plan mode, you must use the options mode.\n\n怎么现在 happy 出来的 Claude 又没有代理了？帮我看看咋回事儿\n\nBased on this message, call functions.happy__change_title to change chat session title.',
+              },
+            }),
+          ].join('\n') + '\n'
+        );
+
+        const res = await harness.app.inject({
+          method: 'GET',
+          url: '/api/codex/history/sessions',
+        });
+
+        expect(res.statusCode).toBe(200);
+        const body = JSON.parse(res.body);
+        expect(body.data.sessions).toEqual([
+          expect.objectContaining({
+            sessionId,
+            firstPrompt: '怎么现在 happy 出来的 Claude 又没有代理了？帮我看看咋回事儿',
           }),
         ]);
       } finally {

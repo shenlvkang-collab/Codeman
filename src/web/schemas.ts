@@ -277,6 +277,7 @@ export const QuickStartSchema = z.object({
     .regex(/^[\p{L}\p{N}_-]+$/u, 'Invalid case name format. Use only letters, numbers, hyphens, underscores.')
     .optional(),
   mode: z.enum(['claude', 'shell', 'opencode', 'codex', 'gemini']).optional(),
+  name: z.string().max(100).optional(),
   openCodeConfig: OpenCodeConfigSchema,
   codexConfig: CodexConfigSchema,
   geminiConfig: GeminiConfigSchema,

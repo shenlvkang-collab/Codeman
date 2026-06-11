@@ -613,6 +613,16 @@ Object.assign(CodemanApp.prototype, {
         return;
       }
 
+      let startNumber = 1;
+      for (const [, session] of this.sessions || new Map()) {
+        const match = session.name && session.name.match(/^w(\d+)-([\p{L}\p{N}_-]+)/u);
+        if (match && match[2] === caseName) {
+          const num = parseInt(match[1]);
+          if (num >= startNumber) startNumber = num + 1;
+        }
+      }
+      const name = `w${startNumber}-${caseName}`;
+
       const globalSettings = this.loadAppSettingsFromStorage();
       const envOverrides = this.buildEnvOverrides(this.getCaseSettings(caseName), globalSettings);
       const res = await fetch('/api/quick-start', {
@@ -620,6 +630,7 @@ Object.assign(CodemanApp.prototype, {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           caseName,
+          name,
           mode: 'codex',
           codexConfig: {
             dangerouslyBypassApprovals: globalSettings.codexDangerouslyBypassApprovals ?? false,

@@ -123,6 +123,10 @@ describe('Codex quick start settings', () => {
 
     const app = new (CodemanApp as any)();
     app.terminal = { clear: () => {}, writeln: () => {}, focus: () => {} };
+    app.sessions = new Map([
+      ['existing-codex-case', { name: 'w1-codex-case' }],
+      ['existing-other-case', { name: 'w7-other-case' }],
+    ]);
     app.loadAppSettingsFromStorage = () => ({
       codexDangerouslyBypassApprovals: true,
     });
@@ -137,6 +141,7 @@ describe('Codex quick start settings', () => {
 
     expect(requests.find((req) => req.url === '/api/quick-start')?.body).toMatchObject({
       caseName: 'codex-case',
+      name: 'w2-codex-case',
       mode: 'codex',
       codexConfig: { dangerouslyBypassApprovals: true, renderMode: 'hybrid' },
     });

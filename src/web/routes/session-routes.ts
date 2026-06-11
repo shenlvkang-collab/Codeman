@@ -1251,6 +1251,7 @@ export function registerSessionRoutes(
     const {
       caseName = 'testcase',
       mode = 'claude',
+      name,
       openCodeConfig,
       codexConfig,
       geminiConfig,
@@ -1367,6 +1368,7 @@ export function registerSessionRoutes(
       mux: ctx.mux,
       useMux: true,
       mode: mode,
+      name: name || '',
       niceConfig: niceConfig,
       model: qsModel,
       claudeMode: qsClaudeModeConfig.claudeMode,
@@ -1779,13 +1781,59 @@ export function registerSessionRoutes(
     firstPrompt?: string;
   };
 
+  function stripHappyPromptWrapper(text: string): string {
+    let out = text.trim();
+    const titleInstructionIdx = out.search(/\n\s*Based on this message, call functions\.happy__change_title\b/i);
+    if (titleInstructionIdx >= 0) out = out.slice(0, titleInstructionIdx).trim();
+
+    if (/^# Options\b/i.test(out)) {
+      const blocks = out
+        .split(/\n{2,}/)
+        .map((block) => block.trim())
+        .filter(Boolean);
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        const block = blocks[i];
+        if (
+          /^# Options\b/i.test(block) ||
+          /^# Plan mode with options\b/i.test(block) ||
+          /^You have a way to give a user\b/i.test(block) ||
+          /^When you are in the plan mode\b/i.test(block) ||
+          /^<options>/i.test(block)
+        ) {
+          continue;
+        }
+        out = block;
+        break;
+      }
+    }
+
+    return out;
+  }
+
+  function isCodexInjectedContext(text: string): boolean {
+    return (
+      /^# AGENTS\.md instructions\b/i.test(text) ||
+      /^<environment_context\b/i.test(text) ||
+      /^<turn_aborted\b/i.test(text) ||
+      /^# Options\b/i.test(text)
+    );
+  }
+
   function truncateHistoryPrompt(text: string): string | undefined {
-    const cleaned = text
+    const raw = stripHappyPromptWrapper(text);
+    if (isCodexInjectedContext(raw)) return undefined;
+
+    const cleaned = raw
       .replace(/<[^>]+>/g, '')
       .replace(new RegExp(String.raw`\x1b\[[0-9;]*[a-zA-Z]`, 'g'), '')
       .trim()
       .replace(/\s+/g, ' ');
-    if (!cleaned || cleaned.length < 3 || /\b(sk-ant-|ANTHROPIC_API_KEY|API_KEY=|SECRET|TOKEN=)/i.test(cleaned)) {
+    if (
+      !cleaned ||
+      cleaned.length < 3 ||
+      isCodexInjectedContext(cleaned) ||
+      /\b(sk-ant-|ANTHROPIC_API_KEY|API_KEY=|SECRET|TOKEN=)/i.test(cleaned)
+    ) {
       return undefined;
     }
     return cleaned.length > 120 ? cleaned.slice(0, 120) + '\u2026' : cleaned;

@@ -1012,10 +1012,15 @@ Object.assign(CodemanApp.prototype, {
    * @returns {Promise<Array>} deduplicated session list, most recent first
    */
   async _fetchHistorySessions() {
-    const res = await fetch('/api/history/sessions');
+    const isCodex = this.runMode === 'codex';
+    const res = await fetch(isCodex ? '/api/codex/history/sessions' : '/api/history/sessions');
     const data = await res.json();
     const sessions = data.data?.sessions || [];
     if (sessions.length === 0) return [];
+
+    if (isCodex) {
+      return sessions.sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
+    }
 
     const byProject = new Map();
     for (const s of sessions) {
@@ -1365,6 +1370,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async resumeHistorySession(sessionId, workingDir) {
+    const isCodex = this.runMode === 'codex';
     // Close the run mode menu if open
     document.getElementById('runModeMenu')?.classList.remove('active');
     // Close folder history modal if open
@@ -1393,16 +1399,28 @@ Object.assign(CodemanApp.prototype, {
       const globalSettings = this.loadAppSettingsFromStorage();
       const envOverrides = this.buildEnvOverrides(this.getCaseSettings(caseName), globalSettings);
       const effort = this.getEffortSetting(globalSettings);
+      const body = {
+        workingDir,
+        name,
+        ...(isCodex
+          ? {
+              mode: 'codex',
+              codexConfig: {
+                resumeSessionId: sessionId,
+                dangerouslyBypassApprovals: globalSettings.codexDangerouslyBypassApprovals ?? false,
+                renderMode: 'hybrid',
+              },
+            }
+          : {
+              resumeSessionId: sessionId,
+              ...(effort ? { effort } : {}),
+            }),
+        ...(Object.keys(envOverrides).length > 0 ? { envOverrides } : {}),
+      };
       const createRes = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          workingDir,
-          name,
-          resumeSessionId: sessionId,
-          ...(Object.keys(envOverrides).length > 0 ? { envOverrides } : {}),
-          ...(effort ? { effort } : {}),
-        }),
+        body: JSON.stringify(body),
       });
       const createData = await createRes.json();
       if (!createData.success) throw new Error(createData.error);

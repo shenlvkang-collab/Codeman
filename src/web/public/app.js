@@ -272,7 +272,7 @@ const _SSE_HANDLER_MAP = [
 // Returns { prefix, suffix } or null if name does not match the pattern.
 function parseSessionPrefix(name) {
   if (!name) return null;
-  const m = name.match(/^(w\d+-[a-zA-Z0-9_-]+|s\d+-[a-zA-Z0-9_-]+)/);
+  const m = name.match(/^(w\d+-[\p{L}\p{N}_-]+|s\d+-[\p{L}\p{N}_-]+)/u);
   if (!m) return null;
   const prefix = m[1];
   const rest = name.slice(prefix.length);

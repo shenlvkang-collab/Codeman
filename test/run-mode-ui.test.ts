@@ -6,7 +6,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 function loadRunModeHarness() {
   const elements: Record<string, any> = {};
@@ -141,6 +141,88 @@ describe('Codex quick start settings', () => {
       codexConfig: { dangerouslyBypassApprovals: true, renderMode: 'hybrid' },
     });
     expect(selected).toEqual(['sess-1']);
+  });
+
+  it('uses Codex history endpoint and resumes history sessions as Codex in Codex mode', async () => {
+    const elements: Record<string, any> = {
+      runModeMenu: { classList: { remove: vi.fn() } },
+    };
+    const requests: Array<{ url: string; body?: any; method?: string }> = [];
+    const CodemanApp = function CodemanApp(this: any) {};
+
+    const context = vm.createContext({
+      CodemanApp,
+      localStorage: {
+        getItem: () => 'codex',
+        setItem: () => {},
+      },
+      document: {
+        getElementById: (id: string) => elements[id] ?? null,
+        removeEventListener: () => {},
+      },
+      fetch: async (url: string, init?: { method?: string; body?: string }) => {
+        requests.push({ url, method: init?.method, body: init?.body ? JSON.parse(init.body) : undefined });
+        if (url === '/api/codex/history/sessions') {
+          return {
+            json: async () => ({
+              success: true,
+              data: {
+                sessions: [
+                  {
+                    sessionId: '019eb6fc-c4d6-7573-943a-6e33bb08bf75',
+                    workingDir: '/mnt/d/AI',
+                    projectKey: '019eb6fc-c4d6-7573-943a-6e33bb08bf75',
+                    sizeBytes: 10000,
+                    lastModified: '2026-06-11T14:03:29.731Z',
+                  },
+                ],
+              },
+            }),
+          };
+        }
+        if (url === '/api/sessions') {
+          return { json: async () => ({ success: true, data: { session: { id: 'new-codex-session' } } }) };
+        }
+        if (url === '/api/sessions/new-codex-session/interactive') {
+          return { json: async () => ({ success: true }) };
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      },
+      console,
+    }) as any;
+    context.window = context;
+
+    const sessionUi = readFileSync(resolve(import.meta.dirname, '../src/web/public/session-ui.js'), 'utf8');
+    const terminalUi = readFileSync(resolve(import.meta.dirname, '../src/web/public/terminal-ui.js'), 'utf8');
+    vm.runInContext(sessionUi, context, { filename: 'session-ui.js' });
+    vm.runInContext(terminalUi, context, { filename: 'terminal-ui.js' });
+
+    const app = new (CodemanApp as any)();
+    app._runMode = 'codex';
+    app.sessions = new Map();
+    app.cases = [{ name: 'normal-use', path: '/mnt/d/AI' }];
+    app.terminal = { clear: vi.fn(), writeln: vi.fn(), focus: vi.fn() };
+    app.loadAppSettingsFromStorage = () => ({ codexDangerouslyBypassApprovals: true });
+    app.getCaseSettings = () => ({});
+    app.buildEnvOverrides = () => ({});
+    app.getEffortSetting = () => 'high';
+    app._closeFolderHistoryModal = vi.fn();
+    app.selectSession = vi.fn();
+
+    await expect(app._fetchHistorySessions()).resolves.toHaveLength(1);
+    await app.resumeHistorySession('019eb6fc-c4d6-7573-943a-6e33bb08bf75', '/mnt/d/AI');
+
+    expect(requests[0].url).toBe('/api/codex/history/sessions');
+    expect(requests.find((req) => req.url === '/api/sessions')?.body).toMatchObject({
+      workingDir: '/mnt/d/AI',
+      mode: 'codex',
+      codexConfig: {
+        resumeSessionId: '019eb6fc-c4d6-7573-943a-6e33bb08bf75',
+        dangerouslyBypassApprovals: true,
+        renderMode: 'hybrid',
+      },
+    });
+    expect(requests.find((req) => req.url === '/api/sessions')?.body).not.toHaveProperty('resumeSessionId');
   });
 });
 

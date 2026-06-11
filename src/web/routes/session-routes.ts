@@ -1465,6 +1465,20 @@ export function registerSessionRoutes(
   // ═══════════════════════════════════════════════════════════════
 
   /** Extract the text of the first user message from a JSONL transcript head. */
+  /**
+   * Pull the real working directory out of a transcript chunk. Claude records
+   * `"cwd":"/real/path"` on every entry; we take the first non-empty one. JSON
+   * encodes '\' as '\\' (Windows paths) and leaves '/' and CJK as-is, so we
+   * unescape backslashes. Returns undefined when the chunk has no cwd field.
+   */
+  function extractCwd(text: string | null | undefined): string | undefined {
+    if (!text) return undefined;
+    const m = text.match(/"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (!m) return undefined;
+    const cwd = m[1].replace(/\\(.)/g, '$1');
+    return cwd.length > 0 ? cwd : undefined;
+  }
+
   function extractFirstUserPrompt(head: string): string | undefined {
     const MAX_PROMPT_LEN = 120;
     // Iterate lines without allocating a full split array
@@ -1514,22 +1528,134 @@ export function registerSessionRoutes(
   }
 
   /**
+   * Encode a filesystem path into the project-dir key Claude CLI uses: every
+   * non-alphanumeric character (path separator, '_', '-', '.', and every
+   * CJK/Unicode char) collapses to '-'. This is the exact, lossy transform
+   * Claude applies — "/mnt/d/AI/文档" → "-mnt-d-AI---".
+   */
+  function encodeProjectKey(absPath: string): string {
+    return absPath.replace(/[^a-zA-Z0-9]/g, '-');
+  }
+
+  /**
+   * Build a key→absolutePath map from everything Codeman already knows about:
+   * registered linked cases, case directories under CASES_DIR, and live session
+   * working dirs. Because we encode each KNOWN path with the same lossy rule
+   * Claude uses, this resolves project keys that string analysis cannot —
+   * notably CJK paths and dirs whose names contain '_'/'-'/'.'/spaces. It also
+   * fixes resume for windows opened directly on the machine (outside Codeman):
+   * as long as the path is registered or currently live, the key maps back to
+   * the exact registered path.
+   */
+  async function collectKnownPathsByKey(): Promise<Map<string, string>> {
+    const byKey = new Map<string, string>();
+    const add = (p: string | undefined): void => {
+      if (!p) return;
+      const key = encodeProjectKey(p);
+      const existing = byKey.get(key);
+      if (existing === undefined) {
+        byKey.set(key, p);
+      } else if (existsSync(p) && !existsSync(existing)) {
+        // On an encoding collision, prefer a path that actually exists on disk.
+        byKey.set(key, p);
+      }
+    };
+
+    // Linked cases — external dirs registered with a label (incl. CJK paths).
+    try {
+      const raw = await fs.readFile(LINKED_CASES_FILE, 'utf-8');
+      const linked = JSON.parse(raw) as Record<string, string>;
+      for (const p of Object.values(linked)) add(p);
+    } catch {
+      // No registry yet — fine.
+    }
+
+    // Case directories under CASES_DIR.
+    try {
+      const entries = await fs.readdir(CASES_DIR, { withFileTypes: true });
+      for (const e of entries) if (e.isDirectory()) add(join(CASES_DIR, e.name));
+    } catch {
+      // CASES_DIR may not exist yet.
+    }
+
+    // Live sessions — covers dirs opened outside Codeman that are now running.
+    for (const session of ctx.sessions.values()) add(session.workingDir);
+
+    return byKey;
+  }
+
+  /**
+   * Reverse a project key by walking the real filesystem and matching each
+   * directory level's ENCODED name against the key. Every real path character
+   * maps to exactly one key character (alnum stays, everything else → '-'), so
+   * we descend from '/', and at each level pick the child whose encoded name is
+   * the next key segment. Comparing encoded forms means a key segment of "--"
+   * matches a real dir "文档", which split('-') analysis can never recover.
+   *
+   * Longest-name-first with backtracking handles dirs whose names contain '-'
+   * (e.g. "diary-app" vs sibling "diary"): if the longer match dead-ends
+   * downstream, we fall back to the shorter one.
+   */
+  async function reverseByEncoding(projKey: string): Promise<string | null> {
+    const descend = async (dir: string, rest: string): Promise<string | null> => {
+      if (rest === '') return dir || '/';
+      if (rest[0] !== '-') return null; // every segment is preceded by a '/' → '-'
+      const after = rest.slice(1);
+      let kids: import('node:fs').Dirent[];
+      try {
+        kids = await fs.readdir(dir || '/', { withFileTypes: true });
+      } catch {
+        return null;
+      }
+      const names = kids
+        .filter((k) => k.isDirectory())
+        .map((k) => k.name)
+        .sort((a, b) => b.length - a.length); // longest first
+      for (const name of names) {
+        const e = encodeProjectKey(name);
+        const next = (dir || '') + '/' + name;
+        if (after === e) return next; // terminal: consumes the whole key
+        if (after.startsWith(e + '-')) {
+          const r = await descend(next, after.slice(e.length));
+          if (r) return r;
+        }
+      }
+      return null;
+    };
+    return descend('', projKey);
+  }
+
+  /**
    * Decode a Claude project key (e.g. "-Users-teigen-Documents-Workspace-AI-project-Mirror")
    * back to a filesystem path ("/Users/teigen/Documents/Workspace/AI_project/Mirror").
    *
-   * Claude CLI encodes both '/' and '_' as '-', so each '-' in the key could be
-   * any of: '/' (path separator), '_' (underscore), or '-' (literal dash).
+   * Claude CLI encodes EVERY non-alphanumeric char as '-' (not just '/' and '_'),
+   * so each '-' in the key could be a path separator, an underscore, a dash, a
+   * dot, a space, or any CJK/Unicode char — and consecutive specials (e.g. a
+   * two-char Chinese dir name) become runs of '-' that carry no recoverable
+   * information on their own.
    *
-   * Strategy: recursive backtracking with longest-match-first preference.
-   * At each segment boundary, try joining as many segments as possible (with '_'
-   * or '-') into a single existing directory name. If a shorter match leads to a
-   * dead end, backtrack and try the next-shorter candidate.
-   *
-   * Why backtracking: when both `diary/` and `diary-app/` exist as siblings, the
-   * naive shortest-match would pick `diary` and then fail to find `app` inside,
-   * leaving the rest of the key unresolved. Longest-first picks `diary-app`.
+   * Resolution order:
+   *   1. knownByKey — registered cases / live sessions, encoded the same way.
+   *      Authoritative; the only way to resolve CJK and ambiguous-collision keys
+   *      exactly. This is what makes resume work for registered paths even when
+   *      the window was opened outside Codeman.
+   *   2. reverseByEncoding — walk the real filesystem matching encoded dir names.
+   *      Resolves unregistered CJK / special-char paths as long as the dirs
+   *      still exist on disk.
+   *   3. Legacy split('-') backtracking below — best effort for paths whose dirs
+   *      no longer exist (so neither 1 nor 2 can match).
    */
-  async function decodeProjectKey(projKey: string): Promise<string> {
+  async function decodeProjectKey(projKey: string, knownByKey?: Map<string, string>): Promise<string> {
+    // 1. Authoritative: a registered case or live session that encodes to this key.
+    const known = knownByKey?.get(projKey);
+    if (known) return known;
+
+    // 2. Structural reversal against the real filesystem (handles CJK / specials).
+    const fsMatch = await reverseByEncoding(projKey);
+    if (fsMatch) return fsMatch;
+
+    // 3. Legacy heuristic fallback (dir may have been deleted/renamed since).
     const encoded = projKey.startsWith('-') ? projKey.slice(1) : projKey;
     const segments = encoded.split('-');
 
@@ -1653,14 +1779,138 @@ export function registerSessionRoutes(
     firstPrompt?: string;
   };
 
+  function truncateHistoryPrompt(text: string): string | undefined {
+    const cleaned = text
+      .replace(/<[^>]+>/g, '')
+      .replace(new RegExp(String.raw`\x1b\[[0-9;]*[a-zA-Z]`, 'g'), '')
+      .trim()
+      .replace(/\s+/g, ' ');
+    if (!cleaned || cleaned.length < 3 || /\b(sk-ant-|ANTHROPIC_API_KEY|API_KEY=|SECRET|TOKEN=)/i.test(cleaned)) {
+      return undefined;
+    }
+    return cleaned.length > 120 ? cleaned.slice(0, 120) + '\u2026' : cleaned;
+  }
+
+  function extractCodexMetadata(
+    text: string,
+    fallbackSessionId: string
+  ): Pick<HistorySession, 'sessionId' | 'workingDir' | 'firstPrompt'> {
+    let sessionId = fallbackSessionId;
+    let workingDir: string | undefined;
+    let firstPrompt: string | undefined;
+
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      try {
+        const entry = JSON.parse(line) as {
+          type?: string;
+          payload?: {
+            id?: string;
+            cwd?: string;
+            type?: string;
+            message?: string;
+            role?: string;
+            content?: Array<{ type?: string; text?: string }> | string;
+          };
+        };
+        if (entry.type === 'session_meta') {
+          if (entry.payload?.id && /^[a-f0-9-]+$/.test(entry.payload.id)) sessionId = entry.payload.id;
+          if (entry.payload?.cwd) workingDir = entry.payload.cwd;
+        } else if (entry.type === 'turn_context') {
+          if (!workingDir && entry.payload?.cwd) workingDir = entry.payload.cwd;
+        } else if (!firstPrompt && entry.type === 'event_msg' && entry.payload?.type === 'user_message') {
+          if (entry.payload.message) firstPrompt = truncateHistoryPrompt(entry.payload.message);
+        } else if (!firstPrompt && entry.type === 'response_item' && entry.payload?.role === 'user') {
+          const content = entry.payload.content;
+          const text =
+            typeof content === 'string'
+              ? content
+              : Array.isArray(content)
+                ? content.find((block) => block.type === 'input_text' || block.type === 'text')?.text
+                : undefined;
+          if (text) firstPrompt = truncateHistoryPrompt(text);
+        }
+      } catch {
+        // Ignore malformed or partial JSONL rows.
+      }
+
+      if (sessionId && workingDir && firstPrompt) break;
+    }
+
+    return {
+      sessionId,
+      workingDir: workingDir || process.env.HOME || '/tmp',
+      firstPrompt,
+    };
+  }
+
+  function codexSessionIdFromFilename(filename: string): string | null {
+    const match = filename.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\.jsonl$/);
+    return match?.[1] ?? null;
+  }
+
+  async function scanCodexHistoryDir(rootDir: string): Promise<HistorySession[]> {
+    const out: HistorySession[] = [];
+
+    const walk = async (dir: string): Promise<void> => {
+      let entries: import('node:fs').Dirent[];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(fullPath);
+          continue;
+        }
+        if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+
+        const fallbackSessionId = codexSessionIdFromFilename(entry.name);
+        if (!fallbackSessionId) continue;
+        const fileStat = await fs.stat(fullPath).catch(() => null);
+        if (!fileStat || fileStat.size < 100) continue;
+        const head = await readFileHead(fullPath, Buffer.alloc(65536));
+        if (!head) continue;
+        const meta = extractCodexMetadata(head, fallbackSessionId);
+        const relDir = dirname(fullPath).slice(rootDir.length).replace(/^\/+/, '') || '.';
+        out.push({
+          ...meta,
+          projectKey: relDir,
+          sizeBytes: fileStat.size,
+          lastModified: fileStat.mtime.toISOString(),
+        });
+      }
+    };
+
+    await walk(rootDir);
+    out.sort((a, b) => new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime());
+    return out;
+  }
+
   // Scan a single project directory and return all valid history sessions in it.
   // Reused by both the global overview and the single-folder drill-down.
-  async function scanProjectDir(projPath: string, projDir: string, headBuf: Buffer): Promise<HistorySession[]> {
+  async function scanProjectDir(
+    projPath: string,
+    projDir: string,
+    headBuf: Buffer,
+    knownByKey?: Map<string, string>
+  ): Promise<HistorySession[]> {
     const out: HistorySession[] = [];
     const stat = await fs.stat(projPath).catch(() => null);
     if (!stat?.isDirectory()) return out;
 
-    const workingDir = await decodeProjectKey(projDir);
+    // The project key is lossy (CJK and special chars collapse to '-'), and
+    // distinct real dirs can collide onto the SAME key — so every transcript
+    // records the real cwd inside it. Prefer that exact value per-session;
+    // decode the key only as a fallback (computed once, lazily).
+    let decodedKey: string | undefined;
+    const decodeKeyOnce = async (): Promise<string> => {
+      if (decodedKey === undefined) decodedKey = await decodeProjectKey(projDir, knownByKey);
+      return decodedKey;
+    };
     const entries = await fs.readdir(projPath).catch(() => [] as string[]);
 
     for (const entry of entries) {
@@ -1696,6 +1946,12 @@ export function registerSessionRoutes(
         if (tail) firstPrompt = extractFirstUserPrompt(tail);
       }
 
+      // Exact working dir: Claude records the real cwd on every transcript line.
+      // This is format-agnostic (POSIX "/mnt/d/AI/文档" or Windows "C:\Users\x")
+      // and resolves keys that collide or contain unrecoverable CJK. Fall back to
+      // decoding the (lossy) project key only when no cwd is present.
+      const workingDir = extractCwd(head) ?? extractCwd(tail) ?? (await decodeKeyOnce());
+
       out.push({
         sessionId,
         workingDir,
@@ -1722,19 +1978,21 @@ export function registerSessionRoutes(
       }
       const offset = Math.max(0, parseInt(query.offset || '0', 10) || 0);
       const limit = Math.min(100, Math.max(1, parseInt(query.limit || '20', 10) || 20));
+      const knownByKey = await collectKnownPathsByKey();
       const projPath = join(projectsDir, query.projectKey);
-      const all = await scanProjectDir(projPath, query.projectKey, headBuf);
+      const all = await scanProjectDir(projPath, query.projectKey, headBuf, knownByKey);
       all.sort((a, b) => new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime());
       return { sessions: all.slice(offset, offset + limit), total: all.length };
     }
 
     // Global overview: scan all projects, return up to 50 most-recent sessions.
+    const knownByKey = await collectKnownPathsByKey();
     const results: HistorySession[] = [];
     try {
       const projectDirs = await fs.readdir(projectsDir);
       for (const projDir of projectDirs) {
         const projPath = join(projectsDir, projDir);
-        const list = await scanProjectDir(projPath, projDir, headBuf);
+        const list = await scanProjectDir(projPath, projDir, headBuf, knownByKey);
         results.push(...list);
       }
     } catch {
@@ -1743,6 +2001,13 @@ export function registerSessionRoutes(
 
     results.sort((a, b) => new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime());
     return { sessions: results.slice(0, 50) };
+  });
+
+  app.get('/api/codex/history/sessions', async () => {
+    const codexHome = process.env.CODEX_HOME || join(process.env.HOME || '/tmp', '.codex');
+    const sessionsDir = join(codexHome, 'sessions');
+    const sessions = await scanCodexHistoryDir(sessionsDir);
+    return { sessions: sessions.slice(0, 50) };
   });
 
   // ═══════════════════════════════════════════════════════════════

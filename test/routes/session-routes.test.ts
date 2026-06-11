@@ -16,6 +16,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createMockRouteContext, type MockRouteContext } from '../mocks/index.js';
 import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { ApiErrorCode, httpStatusForErrorCode } from '../../src/types.js';
@@ -759,6 +762,66 @@ describe('session-routes', () => {
       });
       const body = JSON.parse(res.body);
       expect(body.data.sessions.length).toBeLessThanOrEqual(50);
+    });
+  });
+
+  // ========== GET /api/codex/history/sessions ==========
+
+  describe('GET /api/codex/history/sessions', () => {
+    it('returns Codex transcript metadata from CODEX_HOME sessions', async () => {
+      const previousCodexHome = process.env.CODEX_HOME;
+      const codexHome = await mkdtemp(join(tmpdir(), 'codeman-codex-home-'));
+      try {
+        process.env.CODEX_HOME = codexHome;
+        const sessionDir = join(codexHome, 'sessions', '2026', '06', '12');
+        await mkdir(sessionDir, { recursive: true });
+        const sessionId = '019eb6fc-c4d6-7573-943a-6e33bb08bf75';
+        await writeFile(
+          join(sessionDir, `rollout-2026-06-12T00-00-00-${sessionId}.jsonl`),
+          [
+            JSON.stringify({
+              timestamp: '2026-06-11T14:03:29.731Z',
+              type: 'session_meta',
+              payload: {
+                id: sessionId,
+                timestamp: '2026-06-11T14:01:19.320Z',
+                cwd: '/mnt/d/AI',
+                cli_version: '0.139.0',
+              },
+            }),
+            JSON.stringify({
+              timestamp: '2026-06-11T14:03:29.754Z',
+              type: 'event_msg',
+              payload: { type: 'user_message', message: 'normal-use powershell codex' },
+            }),
+          ].join('\n') + '\n'
+        );
+
+        const res = await harness.app.inject({
+          method: 'GET',
+          url: '/api/codex/history/sessions',
+        });
+
+        expect(res.statusCode).toBe(200);
+        const body = JSON.parse(res.body);
+        expect(body.data.sessions).toEqual([
+          expect.objectContaining({
+            sessionId,
+            workingDir: '/mnt/d/AI',
+            projectKey: '2026/06/12',
+            sizeBytes: expect.any(Number),
+            lastModified: expect.any(String),
+            firstPrompt: 'normal-use powershell codex',
+          }),
+        ]);
+      } finally {
+        if (previousCodexHome === undefined) {
+          delete process.env.CODEX_HOME;
+        } else {
+          process.env.CODEX_HOME = previousCodexHome;
+        }
+        await rm(codexHome, { recursive: true, force: true });
+      }
     });
   });
 

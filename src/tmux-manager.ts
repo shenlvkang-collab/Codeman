@@ -1134,6 +1134,25 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // launched in TMUX_LAUNCH_CWD (/tmp) rather than the real workingDir: a FUSE/rclone
       // mount that isn't ready yet makes `getcwd` fail and breaks the spawn (see #110). The
       // pane cd's into workingDir below via respawn-pane.
+      //
+      // Force default-terminal to `screen` BEFORE creating the pane so TUIs
+      // (Claude/Codex) keep their output in tmux's main buffer with scrollback
+      // intact. Newer tmux (3.4+) defaults default-terminal to `tmux-256color`,
+      // under which Claude switches to the scrollback-less alternate screen and
+      // the user can no longer scroll back through the conversation; older tmux
+      // defaulted to `screen`, which avoids the alt-screen. True color still
+      // works via the `terminal-overrides ",*:Tc"` set below. Must precede
+      // new-session — a pane's TERM is fixed at window-creation time.
+      try {
+        execSync(`${this.tmux()} start-server`, { timeout: EXEC_TIMEOUT_MS, stdio: 'ignore', env: cleanEnv });
+        execSync(`${this.tmux()} set-option -g default-terminal screen`, {
+          timeout: EXEC_TIMEOUT_MS,
+          stdio: 'ignore',
+          env: cleanEnv,
+        });
+      } catch {
+        /* Non-critical — falls back to tmux's default default-terminal */
+      }
       execSync(`${this.tmux()} new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD}`, {
         cwd: TMUX_LAUNCH_CWD,
         timeout: EXEC_TIMEOUT_MS,

@@ -18,7 +18,7 @@ import {
   type ApiResponse,
   type SessionColor,
 } from '../../types.js';
-import { Session, isAltScreenStripMode } from '../../session.js';
+import { Session } from '../../session.js';
 import { SseEvent } from '../sse-events.js';
 import {
   CreateSessionSchema,
@@ -45,13 +45,7 @@ import {
   validatePathWithinBase,
 } from '../route-helpers.js';
 import { AUTH_COOKIE_NAME } from '../middleware/auth.js';
-import {
-  writeHooksConfig,
-  updateCaseModel,
-  stripCaseEnvKeys,
-  applyStatusLineConfig,
-  refreshStaleHookSecret,
-} from '../../hooks-config.js';
+import { writeHooksConfig, updateCaseModel, stripCaseEnvKeys } from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { imageWatcher } from '../../image-watcher.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
@@ -60,7 +54,6 @@ import { MAX_CONCURRENT_SESSIONS } from '../../config/map-limits.js';
 import { RunSummaryTracker } from '../../run-summary.js';
 
 import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal-limits.js';
-import { MAX_PASTE_IMAGE_BYTES } from '../../config/buffer-limits.js';
 import { dataPath } from '../../config/instance.js';
 
 // Path to linked-cases registry (same file used by case-routes resolveCasePath)
@@ -80,13 +73,12 @@ const LEADING_WHITESPACE_PATTERN = /^[\s\r\n]+/;
  *   (1049 also saves cursor and clears the alt buffer).
  * - CSI 3 J = erase saved lines (scrollback).
  *
- * Codex AND Claude Code emit `\x1b[?1049h` and clear-scrollback sequences (the
- * latter intermittently, e.g. full-screen pickers/dialogs). xterm.js obeys them
- * by switching to the alt buffer (no native scrollback) and wiping saved lines,
- * so the user's conversation history disappears on every tab switch / pane
- * refresh (and scroll-up breaks live). Stripping these from the replayed byte
- * stream keeps everything in the main buffer with scrollback intact. Mirrors the
- * live-stream strip in Session._handleTerminalOutput (isAltScreenStripMode).
+ * Codex emits `\x1b[?1049h` and clear-scrollback sequences during startup and
+ * on repaint. xterm.js obeys them by switching to the alt buffer (no native
+ * scrollback) and wiping saved lines, so the user's conversation history
+ * disappears on every tab switch / pane refresh. Stripping these from the
+ * replayed byte stream keeps everything in the main buffer with scrollback
+ * intact. Mirrors the live-stream strip in Session._handleTerminalOutput.
  */
 // eslint-disable-next-line no-control-regex
 const ALT_SCREEN_TOGGLE_PATTERN = /\x1b\[\?(?:47|1047|1049)[hl]/g;
@@ -287,14 +279,12 @@ export function registerSessionRoutes(
     //
     // For keys the caller is actively setting, strip any stale disk entry a prior
     // Codeman version may have written. Scope limited to:
-    //   - Claude mode (OpenCode/Codex/Gemini don't read .claude/settings.local.json)
+    //   - Claude mode (OpenCode doesn't read .claude/settings.local.json)
     //   - workingDir inside CASES_DIR (Codeman's managed territory — we never mutate
     //     .claude/settings.local.json in arbitrary user repos that POST /api/sessions
     //     can target, because those may have hand-authored values).
     const canStripDisk =
       body.mode !== 'opencode' &&
-      body.mode !== 'codex' &&
-      body.mode !== 'gemini' &&
       body.envOverrides &&
       Object.keys(body.envOverrides).length > 0 &&
       workingDir.startsWith(CASES_DIR + '/');
@@ -305,28 +295,6 @@ export function registerSessionRoutes(
     // Write model override to .claude/settings.local.json if provided
     if (body.modelOverride !== undefined) {
       await updateCaseModel(workingDir, body.modelOverride || null);
-    }
-
-    // Plan-usage statusLine exporter (App Settings → Display → "Plan Usage
-    // Limits"). Claude-only; runs for ANY working dir (linked cases / real repos,
-    // where most sessions live), mirroring updateCaseModel above.
-    //
-    // ADD-ONLY: we never remove on create. Sessions in a repo share one
-    // settings.local.json, so a single create-with-false (e.g. a client whose
-    // synced setting hadn't loaded yet) must NOT yank the statusLine out from
-    // under other live sessions in that repo — that breaks their footer + the
-    // chip's data feed for everyone. The exporter is benign when the chip is off
-    // (the footer just shows session status). isOurs-guarded so a user's own
-    // statusLine is never touched.
-    if ((body.mode ?? 'claude') === 'claude' && body.statusLineTelemetry === true) {
-      await applyStatusLineConfig(workingDir, true);
-    }
-
-    // COD-91 self-heal: refresh a pre-secret hooks block in an existing case so the now
-    // unconditional hook-secret gate keeps accepting its hook events. No-op for fresh
-    // cases (writeHooksConfig already wrote the secret) and for non-Codeman/absent hooks.
-    if ((body.mode ?? 'claude') === 'claude') {
-      await refreshStaleHookSecret(workingDir).catch(() => {});
     }
 
     // Check OpenCode availability if requested
@@ -347,17 +315,6 @@ export function registerSessionRoutes(
         return createErrorResponse(
           ApiErrorCode.OPERATION_FAILED,
           'Codex CLI not found. Install with: npm install -g @openai/codex'
-        );
-      }
-    }
-
-    // Check Gemini availability if requested
-    if (body.mode === 'gemini') {
-      const { isGeminiAvailable } = await import('../../utils/gemini-cli-resolver.js');
-      if (!isGeminiAvailable()) {
-        return createErrorResponse(
-          ApiErrorCode.OPERATION_FAILED,
-          'Gemini CLI not found. Install with: npm install -g @google/gemini-cli'
         );
       }
     }
@@ -400,11 +357,9 @@ export function registerSessionRoutes(
         ? body.openCodeConfig?.model
         : mode === 'codex'
           ? body.codexConfig?.model
-          : mode === 'gemini'
-            ? body.geminiConfig?.model
-            : mode !== 'shell'
-              ? modelConfig?.defaultModel || undefined
-              : undefined;
+          : mode !== 'shell'
+            ? modelConfig?.defaultModel || undefined
+            : undefined;
     const claudeModeConfig = await ctx.getClaudeModeConfig();
     const session = new Session({
       workingDir,
@@ -418,7 +373,6 @@ export function registerSessionRoutes(
       allowedTools: claudeModeConfig.allowedTools,
       openCodeConfig: mode === 'opencode' ? body.openCodeConfig : undefined,
       codexConfig: mode === 'codex' ? body.codexConfig : undefined,
-      geminiConfig: mode === 'gemini' ? body.geminiConfig : undefined,
       resumeSessionId: validatedResumeId,
       envOverrides: body.envOverrides,
       effort: body.effort,
@@ -617,11 +571,9 @@ export function registerSessionRoutes(
 
     try {
       // Auto-detect completion phrase from CLAUDE.md BEFORE starting (only if globally enabled and not explicitly disabled by user)
-      // Ralph tracker is not supported for opencode / codex / gemini sessions
+      // Ralph tracker is not supported for opencode sessions
       if (
         session.mode !== 'opencode' &&
-        session.mode !== 'codex' &&
-        session.mode !== 'gemini' &&
         ctx.store.getConfig().ralphEnabled &&
         !session.ralphTracker.autoEnableDisabled
       ) {
@@ -681,7 +633,7 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/input', async (req) => {
     const { id } = req.params as { id: string };
-    const { input, useMux, seq, clientId } = parseBody(SessionInputWithLimitSchema, req.body);
+    const { input, useMux } = parseBody(SessionInputWithLimitSchema, req.body);
     const session = findSessionOrFail(ctx, id);
 
     const inputStr = String(input);
@@ -690,13 +642,6 @@ export function registerSessionRoutes(
         ApiErrorCode.INVALID_INPUT,
         `Input exceeds maximum length (${MAX_INPUT_LENGTH} bytes)`
       );
-    }
-
-    // Reliable delivery (POST fallback when the WebSocket is down): a 2xx IS the
-    // client's ACK, so a tagged duplicate redelivery must still return 200 but
-    // skip the write. Untagged requests (curl/legacy) always apply.
-    if (typeof clientId === 'string' && typeof seq === 'number' && !session.shouldApplyInput(clientId, seq)) {
-      return {};
     }
 
     // Write input to PTY. Direct write is synchronous; writeViaMux
@@ -772,10 +717,14 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/resize', async (req) => {
     const { id } = req.params as { id: string };
-    const { cols, rows, viewportType, force } = parseBody(ResizeSchema, req.body);
+    const { cols, rows, viewportType } = parseBody(ResizeSchema, req.body);
     const session = findSessionOrFail(ctx, id);
 
-    session.resize(cols, rows, { viewportType, force });
+    if (viewportType) {
+      session.resize(cols, rows, { viewportType });
+    } else {
+      session.resize(cols, rows);
+    }
     return {};
   });
 
@@ -983,24 +932,7 @@ export function registerSessionRoutes(
     const query = req.query as { tail?: string };
     const session = findSessionOrFail(ctx, id);
 
-    // Prepend the live tmux pane buffer so tab-switch replay shows the current
-    // on-screen frame, not just the accumulated byte history. This matters for
-    // TUI modes (codex/opencode) that repaint only their latest frame: the
-    // accumulated buffer alone replays as the idle banner. We clear the viewport
-    // (`\x1b[H\x1b[2J`) between the history and the live pane so they don't
-    // overlap. `captureActivePaneBuffer` is a no-op ('') under test mode and
-    // returns null when unavailable, in which case we fall back to history.
-    const muxName = session.muxName;
-    const liveMuxBuffer =
-      muxName && typeof ctx.mux.captureActivePaneBuffer === 'function'
-        ? ctx.mux.captureActivePaneBuffer(muxName)
-        : null;
-    const rawBuffer =
-      liveMuxBuffer !== null && liveMuxBuffer.length > 0
-        ? session.terminalBufferLength > 0
-          ? `${session.terminalBuffer}\x1b[H\x1b[2J${liveMuxBuffer}`
-          : liveMuxBuffer
-        : session.terminalBuffer;
+    const rawBuffer = session.terminalBuffer;
     const tailBytes = query.tail ? parseInt(query.tail, 10) : 0;
     const fullSize = rawBuffer.length;
     let truncated = false;
@@ -1012,11 +944,10 @@ export function registerSessionRoutes(
     // the terminal appears empty when switching tabs.
     let strippedBuffer = stripInkRedrawBloat(rawBuffer);
 
-    // Strip alt-screen toggles and scrollback-erase from Codex/Claude byte
-    // streams. xterm.js obeys them by switching to its scrollback-less alt
-    // buffer and wiping saved lines, so conversation history disappears on tab
-    // switch. Same gate as the live-stream strip in session.ts.
-    if (isAltScreenStripMode(session.mode)) {
+    // Strip alt-screen toggles and scrollback-erase from codex byte streams.
+    // xterm.js obeys them by switching to its scrollback-less alt buffer and
+    // wiping saved lines, so conversation history disappears on tab switch.
+    if (session.mode === 'codex') {
       strippedBuffer = strippedBuffer
         .replace(ALT_SCREEN_TOGGLE_PATTERN, '')
         .replace(ERASE_SCROLLBACK_PATTERN, '')
@@ -1253,7 +1184,6 @@ export function registerSessionRoutes(
       mode = 'claude',
       openCodeConfig,
       codexConfig,
-      geminiConfig,
       envOverrides,
       effort,
     } = parseBody(QuickStartSchema, req.body);
@@ -1276,17 +1206,6 @@ export function registerSessionRoutes(
         return createErrorResponse(
           ApiErrorCode.OPERATION_FAILED,
           'Codex CLI not found. Install with: npm install -g @openai/codex'
-        );
-      }
-    }
-
-    // Check Gemini availability if requested
-    if (mode === 'gemini') {
-      const { isGeminiAvailable } = await import('../../utils/gemini-cli-resolver.js');
-      if (!isGeminiAvailable()) {
-        return createErrorResponse(
-          ApiErrorCode.OPERATION_FAILED,
-          'Gemini CLI not found. Install with: npm install -g @google/gemini-cli'
         );
       }
     }
@@ -1319,8 +1238,8 @@ export function registerSessionRoutes(
         writeFileSync(join(casePath, 'CLAUDE.md'), claudeMd);
 
         // Write .claude/settings.local.json with hooks for desktop notifications
-        // (Claude-specific — OpenCode, Codex, and Gemini use their own systems)
-        if (mode !== 'opencode' && mode !== 'codex' && mode !== 'gemini') {
+        // (Claude-specific — OpenCode uses its own plugin system)
+        if (mode !== 'opencode') {
           await writeHooksConfig(casePath);
         }
 
@@ -1328,22 +1247,11 @@ export function registerSessionRoutes(
       } catch (err) {
         return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to create case: ${getErrorMessage(err)}`);
       }
-    } else if (mode !== 'opencode') {
-      // COD-91 self-heal for an EXISTING case: refresh a pre-secret hooks block so the
-      // now-unconditional hook-secret gate keeps accepting its hook events. No-op when
-      // the hooks aren't ours or already carry the secret.
-      await refreshStaleHookSecret(casePath).catch(() => {});
     }
 
     // Strip stale disk entries for keys this request is actively setting (Claude only —
     // see POST /api/sessions for full rationale).
-    if (
-      mode !== 'opencode' &&
-      mode !== 'codex' &&
-      mode !== 'gemini' &&
-      envOverrides &&
-      Object.keys(envOverrides).length > 0
-    ) {
+    if (mode !== 'opencode' && envOverrides && Object.keys(envOverrides).length > 0) {
       await stripCaseEnvKeys(casePath, Object.keys(envOverrides));
     }
 
@@ -1356,11 +1264,9 @@ export function registerSessionRoutes(
         ? openCodeConfig?.model
         : mode === 'codex'
           ? codexConfig?.model
-          : mode === 'gemini'
-            ? geminiConfig?.model
-            : mode !== 'shell'
-              ? qsModelConfig?.defaultModel || undefined
-              : undefined;
+          : mode !== 'shell'
+            ? qsModelConfig?.defaultModel || undefined
+            : undefined;
     const qsClaudeModeConfig = await ctx.getClaudeModeConfig();
     const session = new Session({
       workingDir: casePath,
@@ -1373,7 +1279,6 @@ export function registerSessionRoutes(
       allowedTools: qsClaudeModeConfig.allowedTools,
       openCodeConfig: mode === 'opencode' ? openCodeConfig : undefined,
       codexConfig: mode === 'codex' ? codexConfig : undefined,
-      geminiConfig: mode === 'gemini' ? geminiConfig : undefined,
       envOverrides,
       effort,
     });
@@ -1412,7 +1317,7 @@ export function registerSessionRoutes(
         });
         ctx.broadcast(SseEvent.SessionInteractive, { id: session.id, mode: 'shell' });
       } else {
-        // 'claude', 'opencode', 'codex', and 'gemini' modes use startInteractive()
+        // Both 'claude' and 'opencode' modes use startInteractive()
         await session.startInteractive();
         getLifecycleLog().log({
           event: 'started',
@@ -1465,20 +1370,6 @@ export function registerSessionRoutes(
   // ═══════════════════════════════════════════════════════════════
 
   /** Extract the text of the first user message from a JSONL transcript head. */
-  /**
-   * Pull the real working directory out of a transcript chunk. Claude records
-   * `"cwd":"/real/path"` on every entry; we take the first non-empty one. JSON
-   * encodes '\' as '\\' (Windows paths) and leaves '/' and CJK as-is, so we
-   * unescape backslashes. Returns undefined when the chunk has no cwd field.
-   */
-  function extractCwd(text: string | null | undefined): string | undefined {
-    if (!text) return undefined;
-    const m = text.match(/"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-    if (!m) return undefined;
-    const cwd = m[1].replace(/\\(.)/g, '$1');
-    return cwd.length > 0 ? cwd : undefined;
-  }
-
   function extractFirstUserPrompt(head: string): string | undefined {
     const MAX_PROMPT_LEN = 120;
     // Iterate lines without allocating a full split array
@@ -1528,137 +1419,22 @@ export function registerSessionRoutes(
   }
 
   /**
-   * Encode a filesystem path into the project-dir key Claude CLI uses: every
-   * non-alphanumeric character (path separator, '_', '-', '.', and every
-   * CJK/Unicode char) collapses to '-'. This is the exact, lossy transform
-   * Claude applies — "/mnt/d/AI/文档" → "-mnt-d-AI---".
-   */
-  function encodeProjectKey(absPath: string): string {
-    return absPath.replace(/[^a-zA-Z0-9]/g, '-');
-  }
-
-  /**
-   * Build a key→absolutePath map from everything Codeman already knows about:
-   * registered linked cases, case directories under CASES_DIR, and live session
-   * working dirs. Because we encode each KNOWN path with the same lossy rule
-   * Claude uses, this resolves project keys that string analysis cannot —
-   * notably CJK paths and dirs whose names contain '_'/'-'/'.'/spaces. It also
-   * fixes resume for windows opened directly on the machine (outside Codeman):
-   * as long as the path is registered or currently live, the key maps back to
-   * the exact registered path.
-   */
-  async function collectKnownPathsByKey(): Promise<Map<string, string>> {
-    const byKey = new Map<string, string>();
-    const add = (p: string | undefined): void => {
-      if (!p) return;
-      const key = encodeProjectKey(p);
-      const existing = byKey.get(key);
-      if (existing === undefined) {
-        byKey.set(key, p);
-      } else if (existsSync(p) && !existsSync(existing)) {
-        // On an encoding collision, prefer a path that actually exists on disk.
-        byKey.set(key, p);
-      }
-    };
-
-    // Linked cases — external dirs registered with a label (incl. CJK paths).
-    try {
-      const raw = await fs.readFile(LINKED_CASES_FILE, 'utf-8');
-      const linked = JSON.parse(raw) as Record<string, string>;
-      for (const p of Object.values(linked)) add(p);
-    } catch {
-      // No registry yet — fine.
-    }
-
-    // Case directories under CASES_DIR.
-    try {
-      const entries = await fs.readdir(CASES_DIR, { withFileTypes: true });
-      for (const e of entries) if (e.isDirectory()) add(join(CASES_DIR, e.name));
-    } catch {
-      // CASES_DIR may not exist yet.
-    }
-
-    // Live sessions — covers dirs opened outside Codeman that are now running.
-    for (const session of ctx.sessions.values()) add(session.workingDir);
-
-    return byKey;
-  }
-
-  /**
-   * Reverse a project key by walking the real filesystem and matching each
-   * directory level's ENCODED name against the key. Every real path character
-   * maps to exactly one key character (alnum stays, everything else → '-'), so
-   * we descend from '/', and at each level pick the child whose encoded name is
-   * the next key segment. Comparing encoded forms means a key segment of "--"
-   * matches a real dir "文档", which split('-') analysis can never recover.
-   *
-   * Longest-name-first with backtracking handles dirs whose names contain '-'
-   * (e.g. "diary-app" vs sibling "diary"): if the longer match dead-ends
-   * downstream, we fall back to the shorter one.
-   */
-  async function reverseByEncoding(projKey: string): Promise<string | null> {
-    const descend = async (dir: string, rest: string): Promise<string | null> => {
-      if (rest === '') return dir || '/';
-      if (rest[0] !== '-') return null; // every segment is preceded by a '/' → '-'
-      const after = rest.slice(1);
-      let kids: import('node:fs').Dirent[];
-      try {
-        kids = await fs.readdir(dir || '/', { withFileTypes: true });
-      } catch {
-        return null;
-      }
-      const names = kids
-        .filter((k) => k.isDirectory())
-        .map((k) => k.name)
-        .sort((a, b) => b.length - a.length); // longest first
-      for (const name of names) {
-        const e = encodeProjectKey(name);
-        const next = (dir || '') + '/' + name;
-        if (after === e) return next; // terminal: consumes the whole key
-        if (after.startsWith(e + '-')) {
-          const r = await descend(next, after.slice(e.length));
-          if (r) return r;
-        }
-      }
-      return null;
-    };
-    return descend('', projKey);
-  }
-
-  /**
    * Decode a Claude project key (e.g. "-Users-teigen-Documents-Workspace-AI-project-Mirror")
    * back to a filesystem path ("/Users/teigen/Documents/Workspace/AI_project/Mirror").
    *
-   * Claude CLI encodes EVERY non-alphanumeric char as '-' (not just '/' and '_'),
-   * so each '-' in the key could be a path separator, an underscore, a dash, a
-   * dot, a space, or any CJK/Unicode char — and consecutive specials (e.g. a
-   * two-char Chinese dir name) become runs of '-' that carry no recoverable
-   * information on their own.
+   * Claude CLI encodes both '/' and '_' as '-', so each '-' in the key could be
+   * any of: '/' (path separator), '_' (underscore), or '-' (literal dash).
    *
-   * Resolution order:
-   *   1. knownByKey — registered cases / live sessions, encoded the same way.
-   *      Authoritative; the only way to resolve CJK and ambiguous-collision keys
-   *      exactly. This is what makes resume work for registered paths even when
-   *      the window was opened outside Codeman.
-   *   2. reverseByEncoding — walk the real filesystem matching encoded dir names.
-   *      Resolves unregistered CJK / special-char paths as long as the dirs
-   *      still exist on disk.
-   *   3. Legacy split('-') backtracking below — best effort for paths whose dirs
-   *      no longer exist (so neither 1 nor 2 can match).
+   * Strategy: recursive backtracking with longest-match-first preference.
+   * At each segment boundary, try joining as many segments as possible (with '_'
+   * or '-') into a single existing directory name. If a shorter match leads to a
+   * dead end, backtrack and try the next-shorter candidate.
+   *
+   * Why backtracking: when both `diary/` and `diary-app/` exist as siblings, the
+   * naive shortest-match would pick `diary` and then fail to find `app` inside,
+   * leaving the rest of the key unresolved. Longest-first picks `diary-app`.
    */
-  async function decodeProjectKey(
-    projKey: string,
-    knownByKey?: Map<string, string>
-  ): Promise<string> {
-    // 1. Authoritative: a registered case or live session that encodes to this key.
-    const known = knownByKey?.get(projKey);
-    if (known) return known;
-
-    // 2. Structural reversal against the real filesystem (handles CJK / specials).
-    const fsMatch = await reverseByEncoding(projKey);
-    if (fsMatch) return fsMatch;
-
-    // 3. Legacy heuristic fallback (dir may have been deleted/renamed since).
+  async function decodeProjectKey(projKey: string): Promise<string> {
     const encoded = projKey.startsWith('-') ? projKey.slice(1) : projKey;
     const segments = encoded.split('-');
 
@@ -1784,25 +1560,12 @@ export function registerSessionRoutes(
 
   // Scan a single project directory and return all valid history sessions in it.
   // Reused by both the global overview and the single-folder drill-down.
-  async function scanProjectDir(
-    projPath: string,
-    projDir: string,
-    headBuf: Buffer,
-    knownByKey?: Map<string, string>
-  ): Promise<HistorySession[]> {
+  async function scanProjectDir(projPath: string, projDir: string, headBuf: Buffer): Promise<HistorySession[]> {
     const out: HistorySession[] = [];
     const stat = await fs.stat(projPath).catch(() => null);
     if (!stat?.isDirectory()) return out;
 
-    // The project key is lossy (CJK and special chars collapse to '-'), and
-    // distinct real dirs can collide onto the SAME key — so every transcript
-    // records the real cwd inside it. Prefer that exact value per-session;
-    // decode the key only as a fallback (computed once, lazily).
-    let decodedKey: string | undefined;
-    const decodeKeyOnce = async (): Promise<string> => {
-      if (decodedKey === undefined) decodedKey = await decodeProjectKey(projDir, knownByKey);
-      return decodedKey;
-    };
+    const workingDir = await decodeProjectKey(projDir);
     const entries = await fs.readdir(projPath).catch(() => [] as string[]);
 
     for (const entry of entries) {
@@ -1838,13 +1601,6 @@ export function registerSessionRoutes(
         if (tail) firstPrompt = extractFirstUserPrompt(tail);
       }
 
-      // Exact working dir: Claude records the real cwd on every transcript line.
-      // This is format-agnostic (POSIX "/mnt/d/AI/文档" or Windows "C:\Users\x")
-      // and resolves keys that collide or contain unrecoverable CJK. Fall back to
-      // decoding the (lossy) project key only when no cwd is present.
-      const workingDir =
-        extractCwd(head) ?? extractCwd(tail) ?? (await decodeKeyOnce());
-
       out.push({
         sessionId,
         workingDir,
@@ -1871,21 +1627,19 @@ export function registerSessionRoutes(
       }
       const offset = Math.max(0, parseInt(query.offset || '0', 10) || 0);
       const limit = Math.min(100, Math.max(1, parseInt(query.limit || '20', 10) || 20));
-      const knownByKey = await collectKnownPathsByKey();
       const projPath = join(projectsDir, query.projectKey);
-      const all = await scanProjectDir(projPath, query.projectKey, headBuf, knownByKey);
+      const all = await scanProjectDir(projPath, query.projectKey, headBuf);
       all.sort((a, b) => new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime());
       return { sessions: all.slice(offset, offset + limit), total: all.length };
     }
 
     // Global overview: scan all projects, return up to 50 most-recent sessions.
-    const knownByKey = await collectKnownPathsByKey();
     const results: HistorySession[] = [];
     try {
       const projectDirs = await fs.readdir(projectsDir);
       for (const projDir of projectDirs) {
         const projPath = join(projectsDir, projDir);
-        const list = await scanProjectDir(projPath, projDir, headBuf, knownByKey);
+        const list = await scanProjectDir(projPath, projDir, headBuf);
         results.push(...list);
       }
     } catch {
@@ -1901,7 +1655,7 @@ export function registerSessionRoutes(
   // ═══════════════════════════════════════════════════════════════
 
   const ALLOWED_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
-  // The per-file size cap (MAX_PASTE_IMAGE_BYTES) is enforced by @fastify/multipart (registered in server.ts).
+  // The 10MB size cap is enforced by @fastify/multipart (registered in server.ts).
 
   app.post('/api/sessions/:id/paste-image', async (req, reply) => {
     // CSRF defense: state-changing routes must come from same origin.
@@ -1938,7 +1692,7 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
 
     // Rate limit per (IP, sessionId): 30/min. Defends against disk-fill DoS
-    // — even an authenticated attacker can otherwise loop large image POSTs.
+    // — even an authenticated attacker can otherwise loop 10MB POSTs.
     if (!consumePasteToken(`${req.ip}:${id}`)) {
       reply.code(429);
       reply.header('Retry-After', '60');
@@ -1952,9 +1706,8 @@ export function registerSessionRoutes(
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Expected multipart/form-data');
     }
 
-    // Read the single file part. @fastify/multipart enforces the per-file size
-    // cap (MAX_PASTE_IMAGE_BYTES) and the 1-file/4-field count limits (server.ts),
-    // replacing a hand-rolled
+    // Read the single file part. @fastify/multipart enforces the 10MB size cap
+    // and the 1-file/4-field count limits (server.ts), replacing a hand-rolled
     // boundary scanner with several bugs: literal boundary matches anywhere in
     // body, LF-only clients silently corrupted the last byte (hard-coded \r\n
     // offsets), no part-count cap.
@@ -1978,8 +1731,7 @@ export function registerSessionRoutes(
       imageBytes = await part.toBuffer();
     } catch (err: unknown) {
       reply.code(413);
-      const maxMb = Math.round(MAX_PASTE_IMAGE_BYTES / (1024 * 1024));
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || `File too large (max ${maxMb}MB)`);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || 'File too large (max 10MB)');
     }
     if (imageBytes.length === 0) {
       reply.code(400);
@@ -2043,22 +1795,9 @@ export function registerSessionRoutes(
       }
     } catch (err: unknown) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-      // Non-recursive mkdir: does not follow symlinks for the leaf.
-      // session.workingDir is guaranteed to exist (live session).
-      try {
-        await fs.mkdir(imageDir);
-      } catch (mkErr: unknown) {
-        // Concurrent uploads (a batch of photos) race to create .claude-images —
-        // the losers get EEXIST. Treat an already-present REAL directory as
-        // success, but re-verify it isn't a symlink a racing actor planted
-        // (preserve the symlink-safety guarantee above).
-        if ((mkErr as NodeJS.ErrnoException).code !== 'EEXIST') throw mkErr;
-        const raceStat = await fs.lstat(imageDir);
-        if (raceStat.isSymbolicLink() || !raceStat.isDirectory()) {
-          reply.code(403);
-          return createErrorResponse(ApiErrorCode.INVALID_INPUT, '.claude-images is not a regular directory');
-        }
-      }
+      // Non-recursive mkdir: errors on EEXIST and does not follow symlinks for
+      // the leaf. session.workingDir is guaranteed to exist (live session).
+      await fs.mkdir(imageDir);
     }
     // Date.now() collides on same-ms uploads from two tabs (last-write wins
     // silently). Append 8 hex chars so concurrent pastes get distinct names.

@@ -333,7 +333,7 @@ Object.assign(CodemanApp.prototype, {
       // Find the highest existing w-number for THIS case to avoid duplicates
       let startNumber = 1;
       for (const [, session] of this.sessions) {
-        const match = session.name && session.name.match(/^w(\d+)-([a-zA-Z0-9_-]+)/);
+        const match = session.name && session.name.match(/^w(\d+)-([\p{L}\p{N}_-]+)/u);
         if (match && match[2] === caseName) {
           const num = parseInt(match[1]);
           if (num >= startNumber) {
@@ -489,7 +489,7 @@ Object.assign(CodemanApp.prototype, {
       // Find the highest existing s-number for THIS case to avoid duplicates
       let startNumber = 1;
       for (const [, session] of this.sessions) {
-        const match = session.name && session.name.match(/^s(\d+)-([a-zA-Z0-9_-]+)/);
+        const match = session.name && session.name.match(/^s(\d+)-([\p{L}\p{N}_-]+)/u);
         if (match && match[2] === caseName) {
           const num = parseInt(match[1]);
           if (num >= startNumber) {
@@ -1335,7 +1335,7 @@ Object.assign(CodemanApp.prototype, {
       return;
     }
 
-    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+    if (!/^[\p{L}\p{N}_-]+$/u.test(name)) {
       this.showToast('Invalid name. Use only letters, numbers, hyphens, underscores.', 'error');
       return;
     }
@@ -1373,7 +1373,7 @@ Object.assign(CodemanApp.prototype, {
       return;
     }
 
-    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+    if (!/^[\p{L}\p{N}_-]+$/u.test(name)) {
       this.showToast('Invalid name. Use only letters, numbers, hyphens, underscores.', 'error');
       return;
     }

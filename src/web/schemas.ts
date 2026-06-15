@@ -261,7 +261,7 @@ export const StatusTelemetrySchema = z.object({
 export const CreateCaseSchema = z.object({
   name: z
     .string()
-    .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format. Use only letters, numbers, hyphens, underscores.'),
+    .regex(/^[\p{L}\p{N}_-]+$/u, 'Invalid case name format. Use only letters, numbers, hyphens, underscores.'),
   description: z.string().max(1000).optional(),
 });
 
@@ -274,7 +274,7 @@ export const CreateCaseSchema = z.object({
 export const QuickStartSchema = z.object({
   caseName: z
     .string()
-    .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format. Use only letters, numbers, hyphens, underscores.')
+    .regex(/^[\p{L}\p{N}_-]+$/u, 'Invalid case name format. Use only letters, numbers, hyphens, underscores.')
     .optional(),
   mode: z.enum(['claude', 'shell', 'opencode', 'codex', 'gemini']).optional(),
   openCodeConfig: OpenCodeConfigSchema,
@@ -576,13 +576,13 @@ export const ScheduledRunSchema = z.object({
 
 /** POST /api/cases/link */
 export const LinkCaseSchema = z.object({
-  name: z.string().regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format'),
+  name: z.string().regex(/^[\p{L}\p{N}_-]+$/u, 'Invalid case name format'),
   path: safePathSchema,
 });
 
 /** PUT /api/cases/order */
 export const CaseOrderSchema = z.object({
-  order: z.array(z.string().regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format')),
+  order: z.array(z.string().regex(/^[\p{L}\p{N}_-]+$/u, 'Invalid case name format')),
 });
 
 /** POST /api/auth/revoke */
@@ -684,7 +684,7 @@ export const PushPreferencesUpdateSchema = z.object({
 export const RalphLoopStartSchema = z.object({
   caseName: z
     .string()
-    .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format')
+    .regex(/^[\p{L}\p{N}_-]+$/u, 'Invalid case name format')
     .optional()
     .default('testcase'),
   taskDescription: z.string().min(1).max(100000),

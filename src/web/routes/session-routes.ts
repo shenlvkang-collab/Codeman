@@ -861,6 +861,14 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id);
 
+    // Local patch: Codex sessions don't write to ~/.claude/projects — their
+    // transcripts live in ~/.codex/sessions/**. Branch to a Codex-specific
+    // reader so the response-viewer ("eye") button works for Codex panes too.
+    if (session.mode === 'codex') {
+      const codexQuery = req.query as { context?: string };
+      return await readCodexLastResponse(session.workingDir, codexQuery.context === 'full');
+    }
+
     // Scan ~/.claude/projects/*/ for the transcript file
     const projectsDir = join(process.env.HOME || '/tmp', '.claude', 'projects');
 
@@ -1936,6 +1944,123 @@ export function registerSessionRoutes(
     await walk(rootDir);
     out.sort((a, b) => new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime());
     return out;
+  }
+
+  // ── Local patch: Codex response-viewer ("eye") support ──────────────────
+  // Codex panes have no stored conversation id (codex generates its own rollout
+  // uuid), so we locate the active transcript by matching session_meta.cwd to
+  // the pane's workingDir and picking the most recently modified rollout.
+  async function findActiveCodexFile(workingDir: string): Promise<string | null> {
+    const codexHome = process.env.CODEX_HOME || join(process.env.HOME || '/tmp', '.codex');
+    const sessionsDir = join(codexHome, 'sessions');
+    let bestPath: string | null = null;
+    let bestMtime = 0;
+    const headBuf = Buffer.alloc(65536);
+
+    const walk = async (dir: string): Promise<void> => {
+      let entries: import('node:fs').Dirent[];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(fullPath);
+          continue;
+        }
+        if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+        const st = await fs.stat(fullPath).catch(() => null);
+        if (!st || st.size < 100) continue;
+        // Cheap pre-filter: a file no newer than the current best can never win,
+        // so skip the (relatively expensive) head read + metadata parse.
+        if (st.mtimeMs <= bestMtime) continue;
+        const head = await readFileHead(fullPath, headBuf);
+        if (!head) continue;
+        const meta = extractCodexMetadata(head, '');
+        if (meta.workingDir !== workingDir) continue;
+        bestPath = fullPath;
+        bestMtime = st.mtimeMs;
+      }
+    };
+
+    await walk(sessionsDir);
+    return bestPath;
+  }
+
+  function extractCodexBlockText(content: unknown, kinds: string[]): string {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    return content
+      .filter(
+        (b): b is { type: string; text: string } =>
+          !!b &&
+          typeof b === 'object' &&
+          kinds.includes((b as { type?: string }).type || '') &&
+          typeof (b as { text?: string }).text === 'string'
+      )
+      .map((b) => b.text)
+      .join('');
+  }
+
+  // Single pass over a Codex rollout: track the last assistant message (for the
+  // default eye view) and, when `full`, the whole user/assistant thread.
+  async function readCodexLastResponse(
+    workingDir: string,
+    full: boolean
+  ): Promise<{
+    text: string;
+    timestamp: string;
+    messages?: Array<{ role: string; text: string; timestamp?: string }>;
+  }> {
+    const empty = full ? { text: '', timestamp: '', messages: [] } : { text: '', timestamp: '' };
+    const filePath = await findActiveCodexFile(workingDir);
+    if (!filePath) return empty;
+
+    let content: string;
+    try {
+      content = await fs.readFile(filePath, 'utf8');
+    } catch {
+      return empty;
+    }
+
+    let lastText = '';
+    let lastTimestamp = '';
+    const messages: Array<{ role: string; text: string; timestamp?: string }> = [];
+
+    for (const line of content.split('\n')) {
+      if (!line) continue;
+      let entry: {
+        timestamp?: string;
+        type?: string;
+        payload?: { type?: string; role?: string; content?: unknown };
+      };
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry.type !== 'response_item' || entry.payload?.type !== 'message') continue;
+      const role = entry.payload?.role;
+      if (role === 'assistant') {
+        const text = extractCodexBlockText(entry.payload?.content, ['output_text', 'text']);
+        if (text) {
+          lastText = text;
+          lastTimestamp = entry.timestamp || '';
+          if (full) messages.push({ role: 'assistant', text, timestamp: entry.timestamp });
+        }
+      } else if (role === 'user' && full) {
+        const text = extractCodexBlockText(entry.payload?.content, ['input_text', 'text']);
+        // Drop Codex's injected context turns (AGENTS.md, environment_context, …)
+        // so the thread shows real user prompts only.
+        if (text && !isCodexInjectedContext(text.trim())) {
+          messages.push({ role: 'user', text, timestamp: entry.timestamp });
+        }
+      }
+    }
+
+    return full ? { text: lastText, timestamp: lastTimestamp, messages } : { text: lastText, timestamp: lastTimestamp };
   }
 
   // Scan a single project directory and return all valid history sessions in it.

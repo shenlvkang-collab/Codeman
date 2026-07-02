@@ -166,6 +166,38 @@ function escapeHtmlText(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
+const INTERNAL_MUX_DISPLAY_NAME_RE = /^(?:Restored:\s*)?(?:codeman|claudeman)-[a-f0-9-]+$/i;
+
+function basenameFromAnyPath(path: string): string {
+  return (
+    path
+      .replace(/[\\/]+$/, '')
+      .split(/[\\/]/)
+      .filter(Boolean)
+      .pop() ||
+    path ||
+    'session'
+  );
+}
+
+export function getRestoredSessionDisplayName(input: {
+  savedName?: string | null;
+  muxDisplayName?: string | null;
+  muxName?: string | null;
+  workingDir: string;
+}): string {
+  const savedName = input.savedName?.trim();
+  if (savedName && !INTERNAL_MUX_DISPLAY_NAME_RE.test(savedName)) return savedName;
+
+  const muxDisplayName = input.muxDisplayName?.trim();
+  if (muxDisplayName && !INTERNAL_MUX_DISPLAY_NAME_RE.test(muxDisplayName)) return muxDisplayName;
+
+  const muxName = input.muxName?.trim();
+  if (muxName && !INTERNAL_MUX_DISPLAY_NAME_RE.test(muxName)) return muxName;
+
+  return basenameFromAnyPath(input.workingDir);
+}
+
 import {
   SESSIONS_LIST_CACHE_TTL,
   SCHEDULED_CLEANUP_INTERVAL,
@@ -2100,9 +2132,14 @@ export class WebServer extends EventEmitter {
             // Restore session settings from state.json (single source of truth)
             const savedState = this.store.getSession(muxSession.sessionId);
 
-            // Determine the correct session name (priority: savedState > muxSession > muxName)
-            // This ensures renamed sessions keep their name after server restart
-            const sessionName = savedState?.name || muxSession.name || muxSession.muxName;
+            // Determine the browser-visible session name. Preserve user names,
+            // but do not expose internal tmux names such as `codeman-abc12345`.
+            const sessionName = getRestoredSessionDisplayName({
+              savedName: savedState?.name,
+              muxDisplayName: muxSession.name,
+              muxName: muxSession.muxName,
+              workingDir: muxSession.workingDir,
+            });
 
             // Create a session object for this mux session
             const recoveryClaudeMode = await this.getClaudeModeConfig();
@@ -2134,9 +2171,9 @@ export class WebServer extends EventEmitter {
               attachmentHistory: savedAttachmentHistory,
             });
 
-            // Update session name if it was a "Restored:" placeholder or doesn't match saved name
-            if (savedState?.name && muxSession.name !== savedState.name) {
-              this.mux.updateSessionName(muxSession.sessionId, savedState.name);
+            // Update mux metadata so future restarts keep the readable title.
+            if (muxSession.name !== sessionName) {
+              this.mux.updateSessionName(muxSession.sessionId, sessionName);
             }
             if (savedState) {
               // Auto-compact

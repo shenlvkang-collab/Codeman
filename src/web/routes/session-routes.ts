@@ -861,6 +861,14 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id);
 
+    // Local patch: Codex sessions don't write to ~/.claude/projects — their
+    // transcripts live in ~/.codex/sessions/**. Branch to a Codex-specific
+    // reader so the response-viewer ("eye") button works for Codex panes too.
+    if (session.mode === 'codex') {
+      const codexQuery = req.query as { context?: string };
+      return await readCodexLastResponse(session.workingDir, codexQuery.context === 'full');
+    }
+
     // Scan ~/.claude/projects/*/ for the transcript file
     const projectsDir = join(process.env.HOME || '/tmp', '.claude', 'projects');
 
@@ -1251,6 +1259,7 @@ export function registerSessionRoutes(
     const {
       caseName = 'testcase',
       mode = 'claude',
+      name,
       openCodeConfig,
       codexConfig,
       geminiConfig,
@@ -1367,6 +1376,7 @@ export function registerSessionRoutes(
       mux: ctx.mux,
       useMux: true,
       mode: mode,
+      name: name || '',
       niceConfig: niceConfig,
       model: qsModel,
       claudeMode: qsClaudeModeConfig.claudeMode,
@@ -1646,10 +1656,7 @@ export function registerSessionRoutes(
    *   3. Legacy split('-') backtracking below — best effort for paths whose dirs
    *      no longer exist (so neither 1 nor 2 can match).
    */
-  async function decodeProjectKey(
-    projKey: string,
-    knownByKey?: Map<string, string>
-  ): Promise<string> {
+  async function decodeProjectKey(projKey: string, knownByKey?: Map<string, string>): Promise<string> {
     // 1. Authoritative: a registered case or live session that encodes to this key.
     const known = knownByKey?.get(projKey);
     if (known) return known;
@@ -1782,6 +1789,280 @@ export function registerSessionRoutes(
     firstPrompt?: string;
   };
 
+  function stripHappyPromptWrapper(text: string): string {
+    let out = text.trim();
+    const titleInstructionIdx = out.search(/\n\s*Based on this message, call functions\.happy__change_title\b/i);
+    if (titleInstructionIdx >= 0) out = out.slice(0, titleInstructionIdx).trim();
+
+    if (/^# Options\b/i.test(out)) {
+      const blocks = out
+        .split(/\n{2,}/)
+        .map((block) => block.trim())
+        .filter(Boolean);
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        const block = blocks[i];
+        if (
+          /^# Options\b/i.test(block) ||
+          /^# Plan mode with options\b/i.test(block) ||
+          /^You have a way to give a user\b/i.test(block) ||
+          /^When you are in the plan mode\b/i.test(block) ||
+          /^<options>/i.test(block)
+        ) {
+          continue;
+        }
+        out = block;
+        break;
+      }
+    }
+
+    return out;
+  }
+
+  function isCodexInjectedContext(text: string): boolean {
+    return (
+      /^# AGENTS\.md instructions\b/i.test(text) ||
+      /^<environment_context\b/i.test(text) ||
+      /^<turn_aborted\b/i.test(text) ||
+      /^# Options\b/i.test(text)
+    );
+  }
+
+  function truncateHistoryPrompt(text: string): string | undefined {
+    const raw = stripHappyPromptWrapper(text);
+    if (isCodexInjectedContext(raw)) return undefined;
+
+    const cleaned = raw
+      .replace(/<[^>]+>/g, '')
+      .replace(new RegExp(String.raw`\x1b\[[0-9;]*[a-zA-Z]`, 'g'), '')
+      .trim()
+      .replace(/\s+/g, ' ');
+    if (
+      !cleaned ||
+      cleaned.length < 3 ||
+      isCodexInjectedContext(cleaned) ||
+      /\b(sk-ant-|ANTHROPIC_API_KEY|API_KEY=|SECRET|TOKEN=)/i.test(cleaned)
+    ) {
+      return undefined;
+    }
+    return cleaned.length > 120 ? cleaned.slice(0, 120) + '\u2026' : cleaned;
+  }
+
+  function extractCodexMetadata(
+    text: string,
+    fallbackSessionId: string
+  ): Pick<HistorySession, 'sessionId' | 'workingDir' | 'firstPrompt'> {
+    let sessionId = fallbackSessionId;
+    let workingDir: string | undefined;
+    let firstPrompt: string | undefined;
+
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      try {
+        const entry = JSON.parse(line) as {
+          type?: string;
+          payload?: {
+            id?: string;
+            cwd?: string;
+            type?: string;
+            message?: string;
+            role?: string;
+            content?: Array<{ type?: string; text?: string }> | string;
+          };
+        };
+        if (entry.type === 'session_meta') {
+          if (entry.payload?.id && /^[a-f0-9-]+$/.test(entry.payload.id)) sessionId = entry.payload.id;
+          if (entry.payload?.cwd) workingDir = entry.payload.cwd;
+        } else if (entry.type === 'turn_context') {
+          if (!workingDir && entry.payload?.cwd) workingDir = entry.payload.cwd;
+        } else if (!firstPrompt && entry.type === 'event_msg' && entry.payload?.type === 'user_message') {
+          if (entry.payload.message) firstPrompt = truncateHistoryPrompt(entry.payload.message);
+        } else if (!firstPrompt && entry.type === 'response_item' && entry.payload?.role === 'user') {
+          const content = entry.payload.content;
+          const text =
+            typeof content === 'string'
+              ? content
+              : Array.isArray(content)
+                ? content.find((block) => block.type === 'input_text' || block.type === 'text')?.text
+                : undefined;
+          if (text) firstPrompt = truncateHistoryPrompt(text);
+        }
+      } catch {
+        // Ignore malformed or partial JSONL rows.
+      }
+
+      if (sessionId && workingDir && firstPrompt) break;
+    }
+
+    return {
+      sessionId,
+      workingDir: workingDir || process.env.HOME || '/tmp',
+      firstPrompt,
+    };
+  }
+
+  function codexSessionIdFromFilename(filename: string): string | null {
+    const match = filename.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\.jsonl$/);
+    return match?.[1] ?? null;
+  }
+
+  async function scanCodexHistoryDir(rootDir: string): Promise<HistorySession[]> {
+    const out: HistorySession[] = [];
+
+    const walk = async (dir: string): Promise<void> => {
+      let entries: import('node:fs').Dirent[];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(fullPath);
+          continue;
+        }
+        if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+
+        const fallbackSessionId = codexSessionIdFromFilename(entry.name);
+        if (!fallbackSessionId) continue;
+        const fileStat = await fs.stat(fullPath).catch(() => null);
+        if (!fileStat || fileStat.size < 100) continue;
+        const head = await readFileHead(fullPath, Buffer.alloc(65536));
+        if (!head) continue;
+        const meta = extractCodexMetadata(head, fallbackSessionId);
+        const relDir = dirname(fullPath).slice(rootDir.length).replace(/^\/+/, '') || '.';
+        out.push({
+          ...meta,
+          projectKey: relDir,
+          sizeBytes: fileStat.size,
+          lastModified: fileStat.mtime.toISOString(),
+        });
+      }
+    };
+
+    await walk(rootDir);
+    out.sort((a, b) => new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime());
+    return out;
+  }
+
+  // ── Local patch: Codex response-viewer ("eye") support ──────────────────
+  // Codex panes have no stored conversation id (codex generates its own rollout
+  // uuid), so we locate the active transcript by matching session_meta.cwd to
+  // the pane's workingDir and picking the most recently modified rollout.
+  async function findActiveCodexFile(workingDir: string): Promise<string | null> {
+    const codexHome = process.env.CODEX_HOME || join(process.env.HOME || '/tmp', '.codex');
+    const sessionsDir = join(codexHome, 'sessions');
+    let bestPath: string | null = null;
+    let bestMtime = 0;
+    const headBuf = Buffer.alloc(65536);
+
+    const walk = async (dir: string): Promise<void> => {
+      let entries: import('node:fs').Dirent[];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(fullPath);
+          continue;
+        }
+        if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+        const st = await fs.stat(fullPath).catch(() => null);
+        if (!st || st.size < 100) continue;
+        // Cheap pre-filter: a file no newer than the current best can never win,
+        // so skip the (relatively expensive) head read + metadata parse.
+        if (st.mtimeMs <= bestMtime) continue;
+        const head = await readFileHead(fullPath, headBuf);
+        if (!head) continue;
+        const meta = extractCodexMetadata(head, '');
+        if (meta.workingDir !== workingDir) continue;
+        bestPath = fullPath;
+        bestMtime = st.mtimeMs;
+      }
+    };
+
+    await walk(sessionsDir);
+    return bestPath;
+  }
+
+  function extractCodexBlockText(content: unknown, kinds: string[]): string {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    return content
+      .filter(
+        (b): b is { type: string; text: string } =>
+          !!b &&
+          typeof b === 'object' &&
+          kinds.includes((b as { type?: string }).type || '') &&
+          typeof (b as { text?: string }).text === 'string'
+      )
+      .map((b) => b.text)
+      .join('');
+  }
+
+  // Single pass over a Codex rollout: track the last assistant message (for the
+  // default eye view) and, when `full`, the whole user/assistant thread.
+  async function readCodexLastResponse(
+    workingDir: string,
+    full: boolean
+  ): Promise<{
+    text: string;
+    timestamp: string;
+    messages?: Array<{ role: string; text: string; timestamp?: string }>;
+  }> {
+    const empty = full ? { text: '', timestamp: '', messages: [] } : { text: '', timestamp: '' };
+    const filePath = await findActiveCodexFile(workingDir);
+    if (!filePath) return empty;
+
+    let content: string;
+    try {
+      content = await fs.readFile(filePath, 'utf8');
+    } catch {
+      return empty;
+    }
+
+    let lastText = '';
+    let lastTimestamp = '';
+    const messages: Array<{ role: string; text: string; timestamp?: string }> = [];
+
+    for (const line of content.split('\n')) {
+      if (!line) continue;
+      let entry: {
+        timestamp?: string;
+        type?: string;
+        payload?: { type?: string; role?: string; content?: unknown };
+      };
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry.type !== 'response_item' || entry.payload?.type !== 'message') continue;
+      const role = entry.payload?.role;
+      if (role === 'assistant') {
+        const text = extractCodexBlockText(entry.payload?.content, ['output_text', 'text']);
+        if (text) {
+          lastText = text;
+          lastTimestamp = entry.timestamp || '';
+          if (full) messages.push({ role: 'assistant', text, timestamp: entry.timestamp });
+        }
+      } else if (role === 'user' && full) {
+        const text = extractCodexBlockText(entry.payload?.content, ['input_text', 'text']);
+        // Drop Codex's injected context turns (AGENTS.md, environment_context, …)
+        // so the thread shows real user prompts only.
+        if (text && !isCodexInjectedContext(text.trim())) {
+          messages.push({ role: 'user', text, timestamp: entry.timestamp });
+        }
+      }
+    }
+
+    return full ? { text: lastText, timestamp: lastTimestamp, messages } : { text: lastText, timestamp: lastTimestamp };
+  }
+
   // Scan a single project directory and return all valid history sessions in it.
   // Reused by both the global overview and the single-folder drill-down.
   async function scanProjectDir(
@@ -1842,8 +2123,7 @@ export function registerSessionRoutes(
       // This is format-agnostic (POSIX "/mnt/d/AI/文档" or Windows "C:\Users\x")
       // and resolves keys that collide or contain unrecoverable CJK. Fall back to
       // decoding the (lossy) project key only when no cwd is present.
-      const workingDir =
-        extractCwd(head) ?? extractCwd(tail) ?? (await decodeKeyOnce());
+      const workingDir = extractCwd(head) ?? extractCwd(tail) ?? (await decodeKeyOnce());
 
       out.push({
         sessionId,
@@ -1894,6 +2174,13 @@ export function registerSessionRoutes(
 
     results.sort((a, b) => new Date(b.lastModified).getTime() - new Date(a.lastModified).getTime());
     return { sessions: results.slice(0, 50) };
+  });
+
+  app.get('/api/codex/history/sessions', async () => {
+    const codexHome = process.env.CODEX_HOME || join(process.env.HOME || '/tmp', '.codex');
+    const sessionsDir = join(codexHome, 'sessions');
+    const sessions = await scanCodexHistoryDir(sessionsDir);
+    return { sessions: sessions.slice(0, 50) };
   });
 
   // ═══════════════════════════════════════════════════════════════

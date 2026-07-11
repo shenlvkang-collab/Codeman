@@ -5,7 +5,7 @@
  */
 
 import { FastifyInstance } from 'fastify';
-import { join, dirname, extname } from 'node:path';
+import { join, dirname, extname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
@@ -866,7 +866,7 @@ export function registerSessionRoutes(
     // reader so the response-viewer ("eye") button works for Codex panes too.
     if (session.mode === 'codex') {
       const codexQuery = req.query as { context?: string };
-      return await readCodexLastResponse(session.workingDir, codexQuery.context === 'full');
+      return await readCodexLastResponse(session, codexQuery.context === 'full');
     }
 
     // Scan ~/.claude/projects/*/ for the transcript file
@@ -1947,16 +1947,51 @@ export function registerSessionRoutes(
   }
 
   // ── Local patch: Codex response-viewer ("eye") support ──────────────────
-  // Codex panes have no stored conversation id (codex generates its own rollout
-  // uuid), so we locate the active transcript by matching session_meta.cwd to
-  // the pane's workingDir and picking the most recently modified rollout.
-  async function findActiveCodexFile(workingDir: string): Promise<string | null> {
+  // Read the rollout's session_meta identity fields (plus turn_context cwd as
+  // a fallback when the huge session_meta line got truncated by the head read).
+  function readCodexRolloutMeta(head: string): { cwd?: string; originator?: string } {
+    let cwd: string | undefined;
+    let originator: string | undefined;
+    for (const line of head.split('\n')) {
+      if (!line) continue;
+      try {
+        const entry = JSON.parse(line) as {
+          type?: string;
+          payload?: { cwd?: string; originator?: string };
+        };
+        if (entry.type === 'session_meta') {
+          cwd ??= entry.payload?.cwd;
+          originator ??= entry.payload?.originator;
+        } else if (entry.type === 'turn_context') {
+          cwd ??= entry.payload?.cwd;
+        }
+      } catch {
+        // Malformed or truncated head line — keep scanning.
+      }
+      if (cwd && originator) break;
+    }
+    return { cwd, originator };
+  }
+
+  // Locate THIS pane's rollout, in order of confidence:
+  //   1. originator match — Codeman spawns codex panes with
+  //      CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codeman_<sessionId>, which codex
+  //      writes into session_meta.originator of every rollout it creates
+  //      (including new files after /new in the same pane; newest match wins).
+  //   2. resume-id match — resumed rollouts keep their ORIGINAL session_meta
+  //      (codex appends without rewriting it), so originator matching can't
+  //      see them; but the rollout uuid is in the filename and we know the id.
+  //   3. legacy cwd+mtime heuristic — panes started before this feature, or
+  //      sessions switched via codex's own /resume picker.
+  async function findActiveCodexFile(session: {
+    id: string;
+    workingDir: string;
+    codexConfig?: { resumeSessionId?: string };
+  }): Promise<string | null> {
     const codexHome = process.env.CODEX_HOME || join(process.env.HOME || '/tmp', '.codex');
     const sessionsDir = join(codexHome, 'sessions');
-    let bestPath: string | null = null;
-    let bestMtime = 0;
-    const headBuf = Buffer.alloc(65536);
 
+    const files: Array<{ path: string; mtimeMs: number }> = [];
     const walk = async (dir: string): Promise<void> => {
       let entries: import('node:fs').Dirent[];
       try {
@@ -1973,20 +2008,31 @@ export function registerSessionRoutes(
         if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
         const st = await fs.stat(fullPath).catch(() => null);
         if (!st || st.size < 100) continue;
-        // Cheap pre-filter: a file no newer than the current best can never win,
-        // so skip the (relatively expensive) head read + metadata parse.
-        if (st.mtimeMs <= bestMtime) continue;
-        const head = await readFileHead(fullPath, headBuf);
-        if (!head) continue;
-        const meta = extractCodexMetadata(head, '');
-        if (meta.workingDir !== workingDir) continue;
-        bestPath = fullPath;
-        bestMtime = st.mtimeMs;
+        files.push({ path: fullPath, mtimeMs: st.mtimeMs });
       }
     };
-
     await walk(sessionsDir);
-    return bestPath;
+    files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    const resumeId = session.codexConfig?.resumeSessionId;
+    const idMatch = resumeId ? files.find((f) => basename(f.path).endsWith(`-${resumeId}.jsonl`)) : undefined;
+
+    // Scan newest-first for our originator; anything older than the id match
+    // can never beat it, so the head reads stop there. The 128 KiB head budget
+    // must cover the session_meta line, which embeds full base_instructions.
+    const originator = `codeman_${session.id}`;
+    const headBuf = Buffer.alloc(131072);
+    let cwdFallback: { path: string; mtimeMs: number } | undefined;
+    for (const f of files) {
+      if (idMatch && f.mtimeMs <= idMatch.mtimeMs) break;
+      const head = await readFileHead(f.path, headBuf);
+      if (!head) continue;
+      const meta = readCodexRolloutMeta(head);
+      if (meta.originator === originator) return f.path; // newest-first → first hit wins
+      if (!cwdFallback && !idMatch && meta.cwd === session.workingDir) cwdFallback = f;
+    }
+
+    return idMatch?.path ?? cwdFallback?.path ?? null;
   }
 
   function extractCodexBlockText(content: unknown, kinds: string[]): string {
@@ -2006,8 +2052,14 @@ export function registerSessionRoutes(
 
   // Single pass over a Codex rollout: track the last assistant message (for the
   // default eye view) and, when `full`, the whole user/assistant thread.
+  //
+  // User turns come from event_msg/user_message when available: codex emits one
+  // per REAL user input, and injected context (AGENTS.md, environment_context,
+  // compaction summaries, …) never appears there — so no filtering heuristics.
+  // response_item user rows duplicate those inputs mixed with the injections;
+  // they are kept only as a fallback for old rollouts without event_msg rows.
   async function readCodexLastResponse(
-    workingDir: string,
+    session: { id: string; workingDir: string; codexConfig?: { resumeSessionId?: string } },
     full: boolean
   ): Promise<{
     text: string;
@@ -2015,7 +2067,7 @@ export function registerSessionRoutes(
     messages?: Array<{ role: string; text: string; timestamp?: string }>;
   }> {
     const empty = full ? { text: '', timestamp: '', messages: [] } : { text: '', timestamp: '' };
-    const filePath = await findActiveCodexFile(workingDir);
+    const filePath = await findActiveCodexFile(session);
     if (!filePath) return empty;
 
     let content: string;
@@ -2027,18 +2079,27 @@ export function registerSessionRoutes(
 
     let lastText = '';
     let lastTimestamp = '';
-    const messages: Array<{ role: string; text: string; timestamp?: string }> = [];
+    let sawEventUserMsg = false;
+    const messages: Array<{ role: string; text: string; timestamp?: string; legacyUser?: boolean }> = [];
 
     for (const line of content.split('\n')) {
       if (!line) continue;
       let entry: {
         timestamp?: string;
         type?: string;
-        payload?: { type?: string; role?: string; content?: unknown };
+        payload?: { type?: string; role?: string; content?: unknown; message?: unknown };
       };
       try {
         entry = JSON.parse(line);
       } catch {
+        continue;
+      }
+      if (full && entry.type === 'event_msg' && entry.payload?.type === 'user_message') {
+        const text = typeof entry.payload.message === 'string' ? entry.payload.message.trim() : '';
+        if (text && !isCodexInjectedContext(text)) {
+          messages.push({ role: 'user', text, timestamp: entry.timestamp });
+          sawEventUserMsg = true;
+        }
         continue;
       }
       if (entry.type !== 'response_item' || entry.payload?.type !== 'message') continue;
@@ -2055,12 +2116,20 @@ export function registerSessionRoutes(
         // Drop Codex's injected context turns (AGENTS.md, environment_context, …)
         // so the thread shows real user prompts only.
         if (text && !isCodexInjectedContext(text.trim())) {
-          messages.push({ role: 'user', text, timestamp: entry.timestamp });
+          messages.push({ role: 'user', text: text.trim(), timestamp: entry.timestamp, legacyUser: true });
         }
       }
     }
 
-    return full ? { text: lastText, timestamp: lastTimestamp, messages } : { text: lastText, timestamp: lastTimestamp };
+    // event_msg rows and response_item rows both carry the real inputs; keep
+    // exactly one copy — the clean event_msg set when present.
+    const thread = (sawEventUserMsg ? messages.filter((m) => !m.legacyUser) : messages).map(
+      ({ role, text, timestamp }) => ({ role, text, timestamp })
+    );
+
+    return full
+      ? { text: lastText, timestamp: lastTimestamp, messages: thread }
+      : { text: lastText, timestamp: lastTimestamp };
   }
 
   // Scan a single project directory and return all valid history sessions in it.

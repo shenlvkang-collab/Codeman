@@ -1827,6 +1827,9 @@ export function registerSessionRoutes(
       /^# AGENTS\.md instructions\b/i.test(text) ||
       /^<environment_context\b/i.test(text) ||
       /^<turn_aborted\b/i.test(text) ||
+      /^<codex_internal_context\b/i.test(text) ||
+      /^<recommended_plugins\b/i.test(text) ||
+      /^<user_instructions\b/i.test(text) ||
       /^# Options\b/i.test(text)
     );
   }
@@ -2018,25 +2021,52 @@ export function registerSessionRoutes(
     await walk(sessionsDir);
     files.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-    const resumeId = session.codexConfig?.resumeSessionId;
+    const rawResumeId = session.codexConfig?.resumeSessionId;
+    const resumeId =
+      rawResumeId && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(rawResumeId)
+        ? rawResumeId
+        : undefined;
     const idMatch = resumeId ? files.find((f) => basename(f.path).endsWith(`-${resumeId}.jsonl`)) : undefined;
 
-    // Scan newest-first for our originator; anything older than the id match
-    // can never beat it, so the head reads stop there. The 128 KiB head budget
-    // must cover the session_meta line, which embeds full base_instructions.
+    // Scan newest-first for our originator; anything strictly older than the
+    // id match can never beat it, so the head reads stop there (mtime ties are
+    // still scanned — a /new rollout may land in the same clock tick). The
+    // 128 KiB head budget covers the session_meta line, which embeds full
+    // base_instructions (observed max ~22 KiB on codex 0.144).
     const originator = `codeman_${session.id}`;
     const headBuf = Buffer.alloc(131072);
     let cwdFallback: { path: string; mtimeMs: number } | undefined;
     for (const f of files) {
-      if (idMatch && f.mtimeMs <= idMatch.mtimeMs) break;
-      const head = await readFileHead(f.path, headBuf);
-      if (!head) continue;
-      const meta = readCodexRolloutMeta(head);
+      if (idMatch && f.mtimeMs < idMatch.mtimeMs) break;
+      const meta = await readCodexRolloutMetaCached(f.path, headBuf);
+      if (!meta) continue;
       if (meta.originator === originator) return f.path; // newest-first → first hit wins
       if (!cwdFallback && !idMatch && meta.cwd === session.workingDir) cwdFallback = f;
     }
 
     return idMatch?.path ?? cwdFallback?.path ?? null;
+  }
+
+  // session_meta is written once when codex creates the rollout and never
+  // rewritten (verified: resume appends without touching it), so the parsed
+  // identity of a given path can be cached forever. This turns the per-request
+  // scan into stat calls plus head reads for new files only.
+  const codexRolloutMetaCache = new Map<string, { cwd?: string; originator?: string }>();
+  async function readCodexRolloutMetaCached(
+    filePath: string,
+    headBuf: Buffer
+  ): Promise<{ cwd?: string; originator?: string } | null> {
+    const cached = codexRolloutMetaCache.get(filePath);
+    if (cached) return cached;
+    const head = await readFileHead(filePath, headBuf);
+    if (!head) return null;
+    const meta = readCodexRolloutMeta(head);
+    // Don't cache a still-incomplete head: a rollout being created may not
+    // have flushed session_meta/turn_context yet.
+    if (!meta.cwd && !meta.originator) return meta;
+    if (codexRolloutMetaCache.size >= 4096) codexRolloutMetaCache.clear();
+    codexRolloutMetaCache.set(filePath, meta);
+    return meta;
   }
 
   function extractCodexBlockText(content: unknown, kinds: string[]): string {
@@ -2083,15 +2113,27 @@ export function registerSessionRoutes(
 
     let lastText = '';
     let lastTimestamp = '';
-    let sawEventUserMsg = false;
     const messages: Array<{ role: string; text: string; timestamp?: string; legacyUser?: boolean }> = [];
+    // Multiset of event-sourced user texts: a real input appears BOTH as an
+    // event_msg and as a response_item row, so each event text cancels exactly
+    // one legacy twin. Legacy rows without an event twin (turns written by an
+    // older codex appending to the same rollout) survive — a file-wide boolean
+    // would wrongly drop them.
+    const eventUserTexts = new Map<string, number>();
 
     for (const line of content.split('\n')) {
       if (!line) continue;
       let entry: {
         timestamp?: string;
         type?: string;
-        payload?: { type?: string; role?: string; content?: unknown; message?: unknown };
+        payload?: {
+          type?: string;
+          role?: string;
+          content?: unknown;
+          message?: unknown;
+          images?: unknown;
+          local_images?: unknown;
+        };
       };
       try {
         entry = JSON.parse(line);
@@ -2099,11 +2141,16 @@ export function registerSessionRoutes(
         continue;
       }
       if (full && entry.type === 'event_msg' && entry.payload?.type === 'user_message') {
-        const text = typeof entry.payload.message === 'string' ? entry.payload.message.trim() : '';
-        if (text && !isCodexInjectedContext(text)) {
-          messages.push({ role: 'user', text, timestamp: entry.timestamp });
-          sawEventUserMsg = true;
-        }
+        let text = typeof entry.payload.message === 'string' ? entry.payload.message.trim() : '';
+        if (text && isCodexInjectedContext(text)) continue;
+        if (text) eventUserTexts.set(text, (eventUserTexts.get(text) || 0) + 1);
+        // Image-only (or image+text) inputs: the text field alone would make
+        // the turn vanish, so surface a placeholder.
+        const imageCount =
+          (Array.isArray(entry.payload.images) ? entry.payload.images.length : 0) +
+          (Array.isArray(entry.payload.local_images) ? entry.payload.local_images.length : 0);
+        if (imageCount > 0) text = text ? `${text}\n\n*[image ×${imageCount}]*` : `*[image ×${imageCount}]*`;
+        if (text) messages.push({ role: 'user', text, timestamp: entry.timestamp });
         continue;
       }
       if (entry.type !== 'response_item' || entry.payload?.type !== 'message') continue;
@@ -2116,20 +2163,26 @@ export function registerSessionRoutes(
           if (full) messages.push({ role: 'assistant', text, timestamp: entry.timestamp });
         }
       } else if (role === 'user' && full) {
-        const text = extractCodexBlockText(entry.payload?.content, ['input_text', 'text']);
+        const text = extractCodexBlockText(entry.payload?.content, ['input_text', 'text']).trim();
         // Drop Codex's injected context turns (AGENTS.md, environment_context, …)
         // so the thread shows real user prompts only.
-        if (text && !isCodexInjectedContext(text.trim())) {
-          messages.push({ role: 'user', text: text.trim(), timestamp: entry.timestamp, legacyUser: true });
+        if (text && !isCodexInjectedContext(text)) {
+          messages.push({ role: 'user', text, timestamp: entry.timestamp, legacyUser: true });
         }
       }
     }
 
-    // event_msg rows and response_item rows both carry the real inputs; keep
-    // exactly one copy — the clean event_msg set when present.
-    const thread = (sawEventUserMsg ? messages.filter((m) => !m.legacyUser) : messages).map(
-      ({ role, text, timestamp }) => ({ role, text, timestamp })
-    );
+    const thread = messages
+      .filter((m) => {
+        if (!m.legacyUser) return true;
+        const n = eventUserTexts.get(m.text) || 0;
+        if (n > 0) {
+          eventUserTexts.set(m.text, n - 1);
+          return false; // duplicate of an event_msg row already in the thread
+        }
+        return true;
+      })
+      .map(({ role, text, timestamp }) => ({ role, text, timestamp }));
 
     return full
       ? { text: lastText, timestamp: lastTimestamp, messages: thread }

@@ -1980,7 +1980,63 @@ export function registerSessionRoutes(
     return { cwd, originator };
   }
 
+  // The pane's last Enter (Session.codexLastSubmitAt) correlated against
+  // ~/.codex/history.jsonl, which logs every submitted user message as
+  // {session_id, ts}. This identifies the thread the pane is ACTUALLY on and
+  // is the only signal that survives /resume, /new and /fork typed inside the
+  // codex TUI itself. An entry is credited to this pane only when its Enter is
+  // the closest among all codex panes, so a menu keystroke in another pane
+  // can't steal the attribution.
+  const codexHistoryPinCache = new Map<string, { submitAt: number; threadId: string }>();
+  async function resolveCodexThreadFromHistory(
+    session: { id: string; codexLastSubmitAt?: number },
+    codexHome: string
+  ): Promise<string | null> {
+    const submitAt = session.codexLastSubmitAt || 0;
+    if (!submitAt) return null;
+    const cached = codexHistoryPinCache.get(session.id);
+    if (cached && cached.submitAt === submitAt) return cached.threadId;
+
+    const histPath = join(codexHome, 'history.jsonl');
+    const st = await fs.stat(histPath).catch(() => null);
+    if (!st || st.size === 0) return null;
+    const tail = await readFileTail(histPath, Buffer.alloc(65536), st.size);
+    if (!tail) return null;
+
+    const WINDOW_MS = 15_000;
+    const otherSubmits: number[] = [];
+    for (const s of ctx.sessions.values()) {
+      if (s.id !== session.id && s.mode === 'codex' && s.codexLastSubmitAt) {
+        otherSubmits.push(s.codexLastSubmitAt);
+      }
+    }
+
+    let best: { threadId: string; dist: number } | undefined;
+    for (const line of tail.split('\n')) {
+      if (!line) continue;
+      let e: { session_id?: string; ts?: number };
+      try {
+        e = JSON.parse(line);
+      } catch {
+        continue; // first tail line may be cut mid-JSON
+      }
+      if (!e.session_id || typeof e.ts !== 'number') continue;
+      const tsMs = e.ts * 1000; // history timestamps are unix seconds
+      const dist = Math.abs(tsMs - submitAt);
+      if (dist > WINDOW_MS) continue;
+      if (otherSubmits.some((o) => Math.abs(tsMs - o) < dist)) continue; // another pane is closer
+      if (!best || dist < best.dist) best = { threadId: e.session_id, dist };
+    }
+    if (!best) return null;
+    if (codexHistoryPinCache.size >= 1024) codexHistoryPinCache.clear();
+    codexHistoryPinCache.set(session.id, { submitAt, threadId: best.threadId });
+    return best.threadId;
+  }
+
   // Locate THIS pane's rollout, in order of confidence:
+  //   0. history match — the thread the pane last submitted a message to
+  //      (see resolveCodexThreadFromHistory); tracks the pane through
+  //      /resume //new //fork typed inside the TUI.
   //   1. originator match — Codeman spawns codex panes with
   //      CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codeman_<sessionId>, which codex
   //      writes into session_meta.originator of every rollout it creates
@@ -1989,10 +2045,13 @@ export function registerSessionRoutes(
   //      (codex appends without rewriting it), so originator matching can't
   //      see them; but the rollout uuid is in the filename and we know the id.
   //   3. legacy cwd+mtime heuristic — panes started before this feature, or
-  //      sessions switched via codex's own /resume picker.
+  //      TUI-resumed threads before their first tracked submit. Case-blind
+  //      cwd compare (codex records the launch-time case, /mnt paths vary)
+  //      and rollouts claimed by OTHER codeman panes are excluded.
   async function findActiveCodexFile(session: {
     id: string;
     workingDir: string;
+    codexLastSubmitAt?: number;
     codexConfig?: { resumeSessionId?: string };
   }): Promise<string | null> {
     const codexHome = process.env.CODEX_HOME || join(process.env.HOME || '/tmp', '.codex');
@@ -2021,6 +2080,12 @@ export function registerSessionRoutes(
     await walk(sessionsDir);
     files.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
+    const historyThreadId = await resolveCodexThreadFromHistory(session, codexHome);
+    if (historyThreadId) {
+      const hit = files.find((f) => basename(f.path).endsWith(`-${historyThreadId}.jsonl`));
+      if (hit) return hit.path;
+    }
+
     const rawResumeId = session.codexConfig?.resumeSessionId;
     const resumeId =
       rawResumeId && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(rawResumeId)
@@ -2034,6 +2099,7 @@ export function registerSessionRoutes(
     // 128 KiB head budget covers the session_meta line, which embeds full
     // base_instructions (observed max ~22 KiB on codex 0.144).
     const originator = `codeman_${session.id}`;
+    const wantCwd = session.workingDir.toLowerCase();
     const headBuf = Buffer.alloc(131072);
     let cwdFallback: { path: string; mtimeMs: number } | undefined;
     for (const f of files) {
@@ -2041,7 +2107,15 @@ export function registerSessionRoutes(
       const meta = await readCodexRolloutMetaCached(f.path, headBuf);
       if (!meta) continue;
       if (meta.originator === originator) return f.path; // newest-first → first hit wins
-      if (!cwdFallback && !idMatch && meta.cwd === session.workingDir) cwdFallback = f;
+      if (
+        !cwdFallback &&
+        !idMatch &&
+        meta.cwd?.toLowerCase() === wantCwd &&
+        // A rollout stamped by another codeman pane belongs to that pane.
+        !(meta.originator?.startsWith('codeman_') && meta.originator !== originator)
+      ) {
+        cwdFallback = f;
+      }
     }
 
     return idMatch?.path ?? cwdFallback?.path ?? null;

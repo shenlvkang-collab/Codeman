@@ -120,12 +120,28 @@ Object.assign(CodemanApp.prototype, {
     this.terminal.attachCustomKeyEventHandler((ev) => {
       if (ev.isComposing || ev.keyCode === 229) return false;
 
-      // Let the app's Alt/Option session-nav shortcuts reach the document keydown handler
+      // Let the app's Alt/Option session-nav and Command Palette shortcuts reach the document keydown handler
       // (app.js switches tabs by PHYSICAL e.code) instead of xterm injecting ESC<char> into
       // the PTY. Mirror app.js's gate exactly — same physical codes + modifier guard — so
-      // macOS Option layouts (Option+1 -> "¡", Option+[ -> "“") are suppressed here too and
+      // macOS Option layouts (Option+1 -> "¡", Option+[ -> "“", Option+K -> "˚") are suppressed here too and
       // don't leak an escape sequence into the focused terminal on every tab switch.
-      if (ev.altKey && !ev.ctrlKey && !ev.shiftKey && /^(Digit[1-9]|BracketLeft|BracketRight)$/.test(ev.code || '')) {
+      if (
+        ev.altKey &&
+        !ev.ctrlKey &&
+        !ev.shiftKey &&
+        /^(Digit[1-9]|BracketLeft|BracketRight|KeyK)$/.test(ev.code || '')
+      ) {
+        return false;
+      }
+
+      // Command palette chord (COD-153): keep it out of the PTY. The document
+      // CAPTURE handler has already opened the palette by the time xterm sees
+      // this keydown, but its preventDefault() does NOT stop xterm — without
+      // this gate Ctrl+K would ALSO write 0x0b (readline kill-line) into the
+      // live session behind the palette, truncating whatever the user had
+      // typed. Route through the registry-aware checker so a rebound or
+      // disabled palette shortcut restores normal terminal Ctrl+K.
+      if (ev.type === 'keydown' && this.shouldOpenCommandPaletteFromShortcut?.(ev)) {
         return false;
       }
 
@@ -252,9 +268,6 @@ Object.assign(CodemanApp.prototype, {
     // Lazy-loaded: script downloaded only on desktop (saves 244KB on mobile).
     this._webglAddon = null;
     const _params = new URLSearchParams(location.search);
-    if (_params.get('webgl') === 'force') {
-      try { localStorage.removeItem('codeman-webgl-disabled'); } catch {}
-    }
     const _stickyDisabled = (() => {
       try {
         const raw = localStorage.getItem('codeman-webgl-disabled');
@@ -269,11 +282,25 @@ Object.assign(CodemanApp.prototype, {
         return true;
       } catch { return false; }
     })();
-    const skipWebGL =
-      MobileDetection.getDeviceType() !== 'desktop' ||
-      _params.has('nowebgl') ||
-      _stickyDisabled;
-    if (_stickyDisabled) {
+    // User's "WebGL Renderer" toggle (Settings > Appearance). undefined = untouched
+    // (desktop default on); false = explicit opt-out; true = explicit opt-in.
+    const _webglSettings = this.loadAppSettingsFromStorage();
+    const _webglDefaults = this.getDefaultSettings();
+    const _webglPref = _webglSettings.webglRendererEnabled ?? _webglDefaults.webglRendererEnabled;
+    const { skip: skipWebGL, clearSticky: _clearWebglSticky } = shouldSkipWebGL({
+      deviceType: MobileDetection.getDeviceType(),
+      noWebglParam: _params.has('nowebgl'),
+      forceParam: _params.get('webgl') === 'force',
+      stickyDisabled: _stickyDisabled,
+      userPrefEnabled: _webglPref,
+    });
+    // Only ?webgl=force retires the auto-fallback marker at init — a stored
+    // toggle ON is incidental (checkbox defaults checked) and must not defeat
+    // the sticky safety net. An OFF→ON flip clears it in saveAppSettings().
+    if (_clearWebglSticky) {
+      try { localStorage.removeItem('codeman-webgl-disabled'); } catch {}
+    }
+    if (skipWebGL && _stickyDisabled) {
       console.log('[CRASH-DIAG] WebGL sticky-disabled from prior stalls — DOM renderer in use. Re-enable: ?webgl=force');
     }
     if (!skipWebGL) {
@@ -305,6 +332,25 @@ Object.assign(CodemanApp.prototype, {
       });
     }
 
+    // ── Focus router ──
+    // While the CJK field is visible, EVERY terminal.focus() call must land on
+    // the CJK field instead. Focusing xterm's hidden textarea in CJK mode sends
+    // the IME's output into a black hole: the keyboard composes normally, but
+    // onData is gated by cjkActive, so nothing reaches the field OR the PTY.
+    // Session select / SSE-reconnect restore paths call terminal.focus() and
+    // were silently stealing focus after every app switch on mobile (the
+    // intermittent "Chinese input goes nowhere" bug). One chokepoint here
+    // covers all ~15 call sites plus any future ones.
+    const _xtermFocus = this.terminal.focus.bind(this.terminal);
+    this.terminal.focus = () => {
+      const cjkEl = document.getElementById('cjkInput');
+      if (cjkEl?.classList.contains('cjk-input-visible')) {
+        cjkEl.focus();
+      } else {
+        _xtermFocus();
+      }
+    };
+
     // On mobile Safari, delay initial fit() to allow layout to settle
     // This prevents 0-column terminals caused by fit() running before container is sized
     const isMobileSafari =
@@ -323,13 +369,27 @@ Object.assign(CodemanApp.prototype, {
     // Register link provider for clickable file paths in Bash tool output
     this.registerFilePathLinkProvider();
 
-    // Always use mouse wheel for terminal scrollback, never forward to application.
-    // Prevents Claude's Ink UI (plan mode selector) from capturing scroll as option navigation.
+    // Mouse wheel: forward to the TUI only for sessions verified to handle SGR
+    // wheel reports (codex, and claude 2.1.187+ — see _shouldForwardWheelToApp),
+    // local scrollback otherwise. Claude Code 2.1.187+ scrolls its own
+    // transcript on SGR wheel reports — scrolled-away tool blocks re-render
+    // live and stay clickable — and its select menus no longer capture wheel
+    // as option navigation (verified against 2.1.202: /model menu highlight
+    // ignores wheel reports); older versions DO capture wheel as option
+    // navigation, so they keep the local wheel.
+    // Shift+wheel always scrolls xterm's local scrollback (Codeman's restored
+    // history lives there), and once the viewport left the bottom the wheel
+    // stays local until the user scrolls back down — so both scrollbacks stay
+    // reachable without a mode switch.
     container.addEventListener(
       'wheel',
       (ev) => {
         ev.preventDefault();
-        const lines = Math.round(ev.deltaY / 25) || (ev.deltaY > 0 ? 1 : -1);
+        const lines = this._wheelScrollLines(ev);
+        if (this._shouldForwardWheelToApp(ev)) {
+          this._sendSyntheticSgrWheel(ev.clientX, ev.clientY, lines);
+          return;
+        }
         this._noteTerminalUserScroll(lines);
         this.terminal.scrollLines(lines);
       },
@@ -452,6 +512,15 @@ Object.assign(CodemanApp.prototype, {
             }
             if (touch && mouseTrackingOn) {
               this._dispatchSyntheticTerminalClick(touch.clientX, touch.clientY);
+            } else if (touch && this._sessionUsesServerMouseStrip()) {
+              // The server strips mouse-tracking DECSETs from claude/codex/gemini
+              // output (isAltScreenStripMode, session.ts) so the wheel keeps
+              // scrolling scrollback — which leaves THIS xterm permanently at
+              // mouseTrackingMode 'none' even though the TUI on the PTY side has
+              // tracking ON and still understands SGR reports. Encode the report
+              // ourselves and send it straight to the PTY: no DOM click is
+              // dispatched, so xterm's local selection can't trigger either.
+              this._sendSyntheticSgrTap(touch.clientX, touch.clientY);
             }
             this._syncMobileHelperTextareaToCursor();
             // Route subsequent typing to the right place: keep the CJK input
@@ -477,6 +546,16 @@ Object.assign(CodemanApp.prototype, {
         { passive: true }
       );
     }
+
+    // ── Desktop click-to-position cursor ──────────────────────────────
+    // A real mouse click normally reaches the PTY through xterm's own mouse
+    // encoder, but that encoder only runs while mouseTrackingMode is ON — and
+    // the server strips the enabling DECSETs from claude/codex/gemini output
+    // (isAltScreenStripMode, session.ts) so the wheel keeps scrolling
+    // scrollback. Desktop clicks therefore stopped reporting entirely (the
+    // same breakage the mobile touchend tap branch above works around).
+    // Hand-encode the SGR report for plain left-clicks on those sessions.
+    container.addEventListener('click', (ev) => this._handleDesktopTerminalClick(ev));
 
     // Welcome message
     this.showWelcome();
@@ -627,7 +706,28 @@ Object.assign(CodemanApp.prototype, {
       // is on, because cjkActive stays true the whole time the field is visible.
       const isMouseReport = /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data);
       // CJK input has focus — block xterm from sending keystrokes to PTY
-      if (!isMouseReport && (window.cjkActive || document.activeElement?.id === 'cjkInput')) return;
+      if (!isMouseReport && (window.cjkActive || document.activeElement?.id === 'cjkInput')) {
+        // Self-heal: if the CJK field is visible but focus drifted to xterm's
+        // hidden textarea (e.g. something called terminal.focus()), everything
+        // typed lands HERE and is swallowed — keyboard shows the IME composing
+        // while both the CJK field and the terminal stay empty. Route focus
+        // back so the very next keystroke lands in the CJK field again.
+        // Only GENUINE typed input qualifies: onData also fires for xterm's
+        // self-generated query replies (DA/DSR/CPR/OSC during Ink redraws),
+        // which arrive no matter what has focus — so require focus to be on
+        // xterm's own textarea and bail on query replies, or this would steal
+        // focus from the rename/search/settings inputs while output streams.
+        const cjkEl = document.getElementById('cjkInput');
+        if (
+          cjkEl?.classList.contains('cjk-input-visible') &&
+          document.activeElement === this.terminal.textarea &&
+          !window.CodemanTerminalInput?.shouldSuppressTerminalQueryResponse(data)
+        ) {
+          _crashDiag.log('CJK regain-focus (onData swallowed input)');
+          cjkEl.focus();
+        }
+        return;
+      }
       if (this.activeSessionId) {
         // Filter terminal query replies generated by xterm.js itself.
         // Forwarding them through the WebSocket injects DA/DSR/CPR replies
@@ -900,6 +1000,12 @@ Object.assign(CodemanApp.prototype, {
             activate(_event, text) {
               window.open(text, '_blank', 'noopener,noreferrer');
             },
+            hover() {
+              self._linkHovered = true;
+            },
+            leave() {
+              self._linkHovered = false;
+            },
           });
         };
 
@@ -937,6 +1043,12 @@ Object.assign(CodemanApp.prototype, {
             },
             activate(event, text) {
               self.openLogViewerWindow(text, self.activeSessionId);
+            },
+            hover() {
+              self._linkHovered = true;
+            },
+            leave() {
+              self._linkHovered = false;
             },
           });
         };
@@ -1037,6 +1149,25 @@ Object.assign(CodemanApp.prototype, {
   },
 
   /**
+   * Fetch the unified session list (live + persisted + non-Claude + closed
+   * history), already de-duplicated and sorted newest-first by the backend
+   * (`GET /api/sessions/unified`, COD-121). No client-side grouping needed.
+   * @param {number} [limit=60] max sessions to request
+   * @returns {Promise<Array>} unified session items, most recent first
+   */
+  async _fetchUnifiedSessions(limit = 60) {
+    const res = await fetch('/api/sessions/unified?limit=' + limit);
+    // ApiResponse envelope: { success, data: { sessions } }. Throw on failure so
+    // callers (loadHistorySessions) hit their catch instead of rendering a 5xx as
+    // an empty history.
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data || data.success === false || !data.data) {
+      throw new Error(data?.error || `unified sessions request failed (HTTP ${res.status})`);
+    }
+    return data.data.sessions || [];
+  },
+
+  /**
    * Resolve workingDir to a case-aware short label.
    * - Exact case path match → "#caseName"
    * - workingDir under a case dir → "#caseName/subdir"
@@ -1074,45 +1205,100 @@ Object.assign(CodemanApp.prototype, {
    * @param {Array} cases linked cases (for #caseName label)
    * @param {object} [options]
    * @param {boolean} [options.showViewAll=true] show "View all in folder" button in detail panel
+   * @param {Function} [options.onActivate] main-row click handler override (default: resume the conversation)
    */
   _buildHistoryItem(s, cases, options) {
     const showViewAll = options?.showViewAll !== false;
-    const size =
-      s.sizeBytes < 1024
+
+    // Size: only render when a numeric byte count is present (unified items
+    // backed solely by a live/persisted source may omit it).
+    const hasSize = typeof s.sizeBytes === 'number';
+    const size = !hasSize
+      ? ''
+      : s.sizeBytes < 1024
         ? `${s.sizeBytes}B`
         : s.sizeBytes < 1048576
           ? `${(s.sizeBytes / 1024).toFixed(0)}K`
           : `${(s.sizeBytes / 1048576).toFixed(1)}M`;
-    const date = new Date(s.lastModified);
-    const timeStr =
-      date.toLocaleDateString('en', { month: 'short', day: 'numeric' }) +
-      ' ' +
-      date.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', hour12: false });
+
+    // Timestamp: unified shape carries lastActivityAt (ms epoch); the older
+    // folder-modal/history shape carries an ISO lastModified string. Prefer ms,
+    // fall back to parsing the string, and omit entirely when neither is valid.
+    const tsMs =
+      typeof s.lastActivityAt === 'number'
+        ? s.lastActivityAt
+        : s.lastModified
+          ? Date.parse(s.lastModified)
+          : NaN;
+    let timeStr = '';
+    if (!Number.isNaN(tsMs)) {
+      const date = new Date(tsMs);
+      timeStr =
+        date.toLocaleDateString('en', { month: 'short', day: 'numeric' }) +
+        ' ' +
+        date.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', hour12: false });
+    }
+
     const shortDir = this._shortenHomePath(s.workingDir);
     const caseLabel = this._resolveCaseLabel(s.workingDir, cases);
 
+    const isLive = Array.isArray(s.sources) && s.sources.includes('live');
+
     const item = document.createElement('div');
     item.className = 'history-item';
-    item.title = s.workingDir;
+    item.title = s.workingDir || '';
 
-    // Main row: clickable surface that triggers resume
+    // Main row: clickable surface. A caller-supplied onActivate wins (the
+    // Session Manager routes live rows to selectSession and history rows to
+    // resume). Otherwise the default focuses the live tab when the row is a
+    // still-running session, else resumes the conversation — keyed by the Claude
+    // conversation UUID (claudeSessionId) when present, since resumed sessions
+    // carry theirs separately from their Codeman id.
     const mainRow = document.createElement('div');
     mainRow.className = 'history-item-main';
-    mainRow.addEventListener('click', () => this.resumeHistorySession(s.sessionId, s.workingDir));
+    mainRow.addEventListener(
+      'click',
+      options?.onActivate ||
+        (() => {
+          if (isLive && this.sessions.has(s.sessionId)) {
+            this.selectSession(s.sessionId);
+          } else {
+            this.resumeHistorySession(s.claudeSessionId || s.sessionId, s.workingDir || '');
+          }
+        })
+    );
 
     const textCol = document.createElement('div');
     textCol.className = 'history-item-text';
 
     const titleSpan = document.createElement('span');
     titleSpan.className = 'history-item-title';
-    titleSpan.textContent = s.firstPrompt || shortDir;
+    titleSpan.textContent = s.name || s.firstPrompt || shortDir;
+
+    // Badge row: mode (claude/codex/opencode/gemini/shell) + a LIVE pill.
+    const badgeRow = document.createElement('div');
+    badgeRow.className = 'history-item-badges';
+    if (s.mode) {
+      const modeBadge = document.createElement('span');
+      modeBadge.className = 'history-item-badge history-item-badge-mode';
+      modeBadge.textContent = s.mode;
+      badgeRow.appendChild(modeBadge);
+    }
+    if (isLive) {
+      const liveBadge = document.createElement('span');
+      liveBadge.className = 'history-item-badge history-item-badge-live';
+      liveBadge.textContent = 'LIVE';
+      badgeRow.appendChild(liveBadge);
+    }
 
     const subtitleSpan = document.createElement('span');
     subtitleSpan.className = 'history-item-subtitle';
     if (caseLabel.startsWith('#')) subtitleSpan.classList.add('is-case');
     subtitleSpan.textContent = caseLabel;
 
-    textCol.append(titleSpan, subtitleSpan);
+    textCol.append(titleSpan);
+    if (badgeRow.childElementCount > 0) textCol.append(badgeRow);
+    textCol.append(subtitleSpan);
 
     const metaSpan = document.createElement('span');
     metaSpan.className = 'history-item-meta';
@@ -1121,7 +1307,11 @@ Object.assign(CodemanApp.prototype, {
     const expandBtn = document.createElement('button');
     expandBtn.className = 'history-item-expand';
     expandBtn.type = 'button';
-    expandBtn.setAttribute('aria-label', 'Show details');
+    // COD-130: the ⋯ button now opens a context (kebab) menu rather than
+    // toggling the inline detail panel directly. aria-expanded still tracks
+    // the detail panel (toggled via the menu's "Show details" item).
+    expandBtn.setAttribute('aria-haspopup', 'menu');
+    expandBtn.setAttribute('aria-label', 'Session actions');
     expandBtn.setAttribute('aria-expanded', 'false');
     expandBtn.textContent = '⋯'; // ⋯
 
@@ -1154,7 +1344,11 @@ Object.assign(CodemanApp.prototype, {
 
     const metaRow = document.createElement('div');
     metaRow.className = 'history-detail-row history-detail-meta';
-    metaRow.textContent = `${timeStr} · ${size} · ${s.sessionId.slice(0, 8)}`;
+    const metaParts = [];
+    if (timeStr) metaParts.push(timeStr);
+    if (hasSize) metaParts.push(size);
+    metaParts.push(s.sessionId.slice(0, 8));
+    metaRow.textContent = metaParts.join(' · ');
 
     detail.append(promptRow, pathRow, metaRow);
 
@@ -1174,14 +1368,177 @@ Object.assign(CodemanApp.prototype, {
     }
 
     expandBtn.addEventListener('click', (ev) => {
+      // COD-130: stop both the row resume handler and the Session Manager
+      // modal's main-row close listener from firing, then open the kebab menu.
       ev.stopPropagation();
-      const expanded = item.classList.toggle('expanded');
-      detail.hidden = !expanded;
-      expandBtn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      ev.preventDefault();
+      this._openSessionRowMenu(ev.currentTarget, s, cases, item, detail);
     });
 
     item.append(mainRow, detail);
     return item;
+  },
+
+  /**
+   * COD-130: Open a context (kebab) menu anchored to a history item's ⋯
+   * button. Replaces the old inline detail-toggle so the same control works
+   * both in the history list and inside the Session Manager modal (where a
+   * capture-phase close listener previously swallowed the click).
+   *
+   * The menu is appended to <body> with fixed positioning so it escapes the
+   * modal's overflow/stacking context, and flips above the anchor when it
+   * would overflow the viewport bottom.
+   *
+   * @param {HTMLElement} anchorEl the ⋯ button the menu anchors to
+   * @param {object} s session record
+   * @param {Array} cases linked cases (unused but kept for parity/future)
+   * @param {HTMLElement} item the .history-item element (for detail toggle)
+   * @param {HTMLElement} detail the inline detail panel element
+   */
+  _openSessionRowMenu(anchorEl, s, cases, item, detail) {
+    // Close any already-open row menu first — call its own close fn so the
+    // previous menu's document/window listeners are detached (a raw .remove()
+    // would leave them dangling until the next event self-cleans).
+    if (this._openRowMenuClose) {
+      try {
+        this._openRowMenuClose();
+      } catch {
+        /* noop */
+      }
+    }
+
+    const isLiveOpen =
+      Array.isArray(s.sources) && s.sources.includes('live') && this.sessions.has(s.sessionId);
+
+    const menu = document.createElement('div');
+    menu.className = 'session-row-menu';
+    menu.setAttribute('role', 'menu');
+
+    // closeMenu tears down the menu and all transient listeners.
+    let onDocMouseDown = null;
+    let onKeyDown = null;
+    let onScrollResize = null;
+    const closeMenu = () => {
+      document.removeEventListener('mousedown', onDocMouseDown, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('scroll', onScrollResize, true);
+      window.removeEventListener('resize', onScrollResize, true);
+      try {
+        menu.remove();
+      } catch {
+        /* noop */
+      }
+      if (this._openRowMenuEl === menu) {
+        this._openRowMenuEl = null;
+        this._openRowMenuClose = null;
+      }
+    };
+
+    // Helper: build one menu item button.
+    const addItem = (label, onActivate, opts) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'session-row-menu-item';
+      btn.setAttribute('role', 'menuitem');
+      const text = document.createElement('span');
+      text.className = 'session-row-menu-label';
+      text.textContent = label;
+      btn.appendChild(text);
+      if (opts && opts.sublabel) {
+        const sub = document.createElement('span');
+        sub.className = 'session-row-menu-sublabel';
+        sub.textContent = opts.sublabel;
+        btn.appendChild(sub);
+      }
+      btn.addEventListener('click', async (ev) => {
+        // Never let the click bubble to the row resume / modal close handlers.
+        ev.stopPropagation();
+        ev.preventDefault();
+        await onActivate();
+      });
+      menu.appendChild(btn);
+    };
+
+    // Resume / Switch to session (always).
+    addItem(
+      isLiveOpen ? 'Switch to session' : 'Resume session',
+      () => {
+        if (isLiveOpen) {
+          this.selectSession(s.sessionId);
+        } else {
+          // Resume by the Claude conversation UUID when present (resumed sessions
+          // carry theirs separately from their Codeman id).
+          this.resumeHistorySession(s.claudeSessionId || s.sessionId, s.workingDir || '');
+        }
+        this.closeSessionManager?.();
+        closeMenu();
+      }
+    );
+
+    // Open folder (only for a live+open session — file browser is session-scoped).
+    if (isLiveOpen) {
+      addItem('Open folder', () => {
+        this.selectSession(s.sessionId);
+        this.loadFileBrowser?.(s.sessionId);
+        this.closeSessionManager?.();
+        closeMenu();
+      });
+    }
+
+    // Copy path (only when a workingDir is known).
+    if (s.workingDir) {
+      addItem('Copy path', async () => {
+        const ok = await this._copyText(s.workingDir);
+        this.showToast(ok ? 'Path copied' : 'Copy failed', ok ? 'success' : 'error');
+        closeMenu();
+      });
+    }
+
+    // Show details (always) — toggles the inline detail panel; keeps modal open.
+    addItem('Show details', () => {
+      const expanded = item.classList.toggle('expanded');
+      detail.hidden = !expanded;
+      anchorEl.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      closeMenu();
+    });
+
+    // Position: fixed, anchored under/over the button; flip up on overflow.
+    document.body.appendChild(menu);
+    const rect = anchorEl.getBoundingClientRect();
+    const menuRect = menu.getBoundingClientRect();
+    const gap = 4;
+    let top = rect.bottom + gap;
+    if (top + menuRect.height > window.innerHeight && rect.top - gap - menuRect.height >= 0) {
+      top = rect.top - gap - menuRect.height; // flip above the anchor
+    }
+    // Right-align the menu to the button, clamped into the viewport.
+    let left = rect.right - menuRect.width;
+    if (left < gap) left = gap;
+    if (left + menuRect.width > window.innerWidth - gap) {
+      left = Math.max(gap, window.innerWidth - gap - menuRect.width);
+    }
+    menu.style.top = `${Math.max(gap, top)}px`;
+    menu.style.left = `${left}px`;
+
+    // Dismissal listeners.
+    onDocMouseDown = (ev) => {
+      if (menu.contains(ev.target) || anchorEl.contains(ev.target)) return;
+      closeMenu();
+    };
+    onKeyDown = (ev) => {
+      if (ev.key === 'Escape') {
+        ev.stopPropagation();
+        closeMenu();
+      }
+    };
+    onScrollResize = () => closeMenu();
+    document.addEventListener('mousedown', onDocMouseDown, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    window.addEventListener('scroll', onScrollResize, true);
+    window.addEventListener('resize', onScrollResize, true);
+
+    this._openRowMenuEl = menu;
+    this._openRowMenuClose = closeMenu;
   },
 
   /** Number of history items shown before "Show More" */
@@ -1199,7 +1556,7 @@ Object.assign(CodemanApp.prototype, {
         ? Promise.resolve(this.cases)
         : fetch('/api/cases').then((r) => (r.ok ? r.json() : null)).then((d) => d?.data || []).catch(() => []);
       const [allSessions, cases] = await Promise.all([
-        this._fetchHistorySessions(30),
+        this._fetchUnifiedSessions(60),
         casesPromise,
       ]);
       if (allSessions.length === 0) {
@@ -1640,7 +1997,11 @@ Object.assign(CodemanApp.prototype, {
   // CJK textarea already provides visual feedback — bypass local echo
   // buffering so each composed word reaches the PTY immediately.
   _handleCjkInput(text) {
-    if (!this.activeSessionId) return;
+    if (!this.activeSessionId) {
+      _crashDiag.log(`CJK send DROP no-session len=${text.length}`);
+      return;
+    }
+    _crashDiag.log(`CJK send→${this.activeSessionId.slice(0, 8)} len=${text.length}`);
     this._sendInputAsync(this.activeSessionId, text);
   },
 
@@ -1943,11 +2304,25 @@ Object.assign(CodemanApp.prototype, {
    * Complete a buffer load: unblock live SSE writes.
    * Called when chunkedTerminalWrite finishes (or is skipped for empty buffers).
    *
-   * Queued SSE events are DISCARDED, not flushed. The loaded buffer from the API
-   * is the source of truth up to the response timestamp. SSE events queued during
-   * the fetch+write overlap with the buffer — flushing them writes duplicate data
-   * (especially Ink cursor-up redraws), corrupting the terminal display.
+   * By default queued SSE events are DISCARDED, not flushed. For an established
+   * session the loaded buffer from the API is the source of truth up to the
+   * response timestamp; SSE events queued during the fetch+write overlap already
+   * appear in that buffer, so flushing them writes duplicate data (especially Ink
+   * cursor-up redraws), corrupting the terminal display.
+   *
+   * COD-144: a brand-new session is the exception. Its terminal fetch can resolve
+   * BEFORE the PTY emits its first prompt, so the fetched buffer is empty and the
+   * prompt arrives only as a queued SSE event. Discarding it leaves the terminal
+   * blank until a tab-switch re-fetches a now-populated buffer. When the caller
+   * knows the load painted nothing (empty fetch + no cache), it passes
+   * `{ flushQueued: true }` so the queued events are REPLAYED through
+   * `batchTerminalWrite()` instead of dropped. Replay runs after `_isLoadingBuffer`
+   * is cleared, so the events write through normally and are not re-queued.
+   *
    * After unblocking, new SSE/WS events deliver subsequent output normally.
+   *
+   * @param {string} [owner] Load token from `_beginBufferLoad`; a stale owner is a no-op.
+   * @param {{ flushQueued?: boolean }} [opts] When `flushQueued` is true, replay any queued events.
    */
   _beginBufferLoad(owner) {
     if (this._bufferLoadSeq === undefined) this._bufferLoadSeq = 0;
@@ -1958,13 +2333,21 @@ Object.assign(CodemanApp.prototype, {
     return loadOwner;
   },
 
-  _finishBufferLoad(owner) {
+  _finishBufferLoad(owner, opts) {
     if (owner !== undefined && this._bufferLoadOwner !== owner) {
       return false;
     }
+    const queued = this._loadBufferQueue;
     this._isLoadingBuffer = false;
     this._loadBufferQueue = null;
     this._bufferLoadOwner = null;
+    // COD-144: replay (rather than discard) queued live events when the load
+    // painted nothing — the queued prompt is the only content a new session has.
+    if (opts?.flushQueued && queued && queued.length) {
+      for (const data of queued) {
+        this.batchTerminalWrite(data);
+      }
+    }
     return true;
   },
 
@@ -2089,6 +2472,156 @@ Object.assign(CodemanApp.prototype, {
     } catch {
       /* MouseEvent constructor unavailable — tap-to-position simply no-ops */
     }
+  },
+
+  // Mirror of the server's isAltScreenStripMode (session.ts): session modes whose
+  // output stream has mouse-tracking DECSET sequences stripped before reaching the
+  // browser. For these, xterm's live mouseTrackingMode is useless as a gate — the
+  // PTY-side TUI keeps tracking enabled, we just never see the enable sequence.
+  _sessionUsesServerMouseStrip() {
+    const mode = this.sessions?.get(this.activeSessionId)?.mode || 'claude';
+    return mode === 'claude' || mode === 'codex' || mode === 'gemini';
+  },
+
+  // True when xterm's viewport shows the live PTY screen (not scrolled up into
+  // local scrollback). SGR coordinates are only meaningful then: the TUI's
+  // screen is the bottom `rows` of the buffer, so a report computed from a
+  // scrolled-up viewport would hit-test a completely different row.
+  _terminalViewportAtBottom() {
+    const buf = this.terminal?.buffer?.active;
+    return !buf || buf.viewportY >= buf.baseY;
+  },
+
+  // Map a viewport point to a 1-based terminal cell the same way xterm maps a
+  // click: offset inside .xterm-screen divided by the rendered cell size,
+  // clamped to the grid. Returns null when the terminal isn't measurable yet.
+  _clientPointToCell(clientX, clientY) {
+    if (!this.terminal || !Number.isFinite(clientX) || !Number.isFinite(clientY)) return null;
+    const screen = this.terminal.element?.querySelector('.xterm-screen');
+    const cell = this.terminal._core?._renderService?.dimensions?.css?.cell;
+    if (!screen || !cell?.width || !cell?.height) return null;
+    const rect = screen.getBoundingClientRect();
+    const col = Math.max(1, Math.min(this.terminal.cols, Math.floor((clientX - rect.left) / cell.width) + 1));
+    const row = Math.max(1, Math.min(this.terminal.rows, Math.floor((clientY - rect.top) / cell.height) + 1));
+    return { col, row };
+  },
+
+  // Encode a tap as an SGR mouse report (press + release at button 0) and send it
+  // to the PTY directly, bypassing xterm's mouse encoder.
+  _sendSyntheticSgrTap(clientX, clientY) {
+    if (!this.activeSessionId) return;
+    if (!this._terminalViewportAtBottom()) return; // scrollback click → misfire, do nothing
+    const pos = this._clientPointToCell(clientX, clientY);
+    if (!pos) return;
+    this._sendInputAsync(this.activeSessionId, `\x1b[<0;${pos.col};${pos.row}M\x1b[<0;${pos.col};${pos.row}m`);
+  },
+
+  // True when a parsed CLI version string ('2.1.187' — banner-parsed on the
+  // server, delivered via session:cliInfo / SessionState.cliVersion) is known
+  // AND >= the minimum. Unknown or unparseable versions return false so
+  // callers keep the conservative behavior.
+  _cliVersionAtLeast(version, minimum) {
+    if (typeof version !== 'string') return false;
+    const parts = version.trim().replace(/^v/, '').split('.').map(Number);
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return false;
+    const min = minimum.split('.').map(Number);
+    for (let i = 0; i < 3; i++) {
+      if (parts[i] !== min[i]) return parts[i] > min[i];
+    }
+    return true;
+  },
+
+  // Wheel forwarding gate for the container wheel handler: no Shift override,
+  // xterm's own encoder dormant, viewport at the bottom, and a TUI VERIFIED to
+  // scroll its transcript on SGR wheel reports: codex, or claude 2.1.187+
+  // (older Claude Code captures wheel as select-menu option navigation; an
+  // unknown version is treated as older). Gemini is a strip mode too but its
+  // wheel behavior is unverified, so it keeps the local wheel — taps/clicks
+  // are still forwarded for it (harmless no-ops at worst).
+  // Wheel delta → whole scroll lines. macOS trackpads turn Shift+two-finger
+  // scroll into a HORIZONTAL wheel (deltaY≈0, deltaX carries the magnitude), and
+  // Shift routes the wheel to local scrollback (_shouldForwardWheelToApp returns
+  // false on Shift). So under Shift, read whichever axis dominates — otherwise
+  // deltaY≈0 collapses to a fixed ±1 line/tick and the gesture can't page through
+  // history on a trackpad (issue #154). Non-Shift and mouse-wheel paths are
+  // unchanged (they carry deltaY). The `|| ±1` keeps sub-25px deltas moving.
+  _wheelScrollLines(ev) {
+    const delta = ev.shiftKey && Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+    return Math.round(delta / 25) || (delta > 0 ? 1 : -1);
+  },
+
+  _shouldForwardWheelToApp(ev) {
+    if (ev.shiftKey) return false;
+    // Opt-out (App Settings → Input → "Wheel scrolls local history"): pin the
+    // plain wheel to xterm's own scrollback like pre-#144, for users who prefer
+    // it over forwarding the wheel to the CLI's transcript (issue #154). Cheap —
+    // loadAppSettingsFromStorage() is cache-backed.
+    if (this.loadAppSettingsFromStorage?.()?.terminalWheelLocalScrollback) return false;
+    const mode = this.terminal?.modes?.mouseTrackingMode;
+    if (mode && mode !== 'none') return false;
+    const session = this.sessions?.get(this.activeSessionId);
+    const sessionMode = session?.mode || 'claude';
+    if (sessionMode === 'claude') {
+      if (!this._cliVersionAtLeast(session?.cliVersion, '2.1.187')) return false;
+    } else if (sessionMode !== 'codex') {
+      return false;
+    }
+    return this._terminalViewportAtBottom();
+  },
+
+  // Encode wheel ticks as SGR reports (button 64 = up, 65 = down) at the pointer
+  // cell. Reports are coalesced into one fire-and-forget write per ~40ms: a
+  // trackpad emits dozens of wheel events per second and each send becomes a
+  // tmux send-keys on the server — unbatched, a single flick would spawn a
+  // process storm. Per-event tick count is capped (Claude applies its own
+  // scroll-speed multiplier and acceleration on top), and the queue is bounded
+  // so a wild scroll can't build a backlog that keeps scrolling after the finger
+  // stops. Flushed via _sendInputEphemeral — loss-tolerant, off the durable queue.
+  _sendSyntheticSgrWheel(clientX, clientY, lines) {
+    if (!this.activeSessionId || !lines) return;
+    const pos = this._clientPointToCell(clientX, clientY);
+    if (!pos) return;
+    const btn = lines < 0 ? 64 : 65;
+    const ticks = Math.min(Math.abs(lines), 5);
+    const queued = this._wheelSgrQueue || '';
+    if (queued.length > 512) return;
+    this._wheelSgrQueue = queued + `\x1b[<${btn};${pos.col};${pos.row}M`.repeat(ticks);
+    if (this._wheelSgrFlushTimer) return;
+    this._wheelSgrFlushTimer = setTimeout(() => this._flushWheelSgrQueue(), 40);
+  },
+
+  _flushWheelSgrQueue() {
+    this._wheelSgrFlushTimer = null;
+    const data = this._wheelSgrQueue;
+    this._wheelSgrQueue = '';
+    // Ephemeral (fire-and-forget): wheel reports are loss-tolerant, so they skip
+    // the durable seq/ACK queue — no localStorage churn, no "Nb queued" flicker
+    // in the connection indicator on every scroll tick.
+    if (data && this.activeSessionId) this._sendInputEphemeral(this.activeSessionId, data);
+  },
+
+  // Desktop counterpart of the touchend tap branch: hand-encode an SGR report
+  // for a plain left-click when the server strips mouse DECSETs (see
+  // _sessionUsesServerMouseStrip). Every skip below is a click that already has
+  // a meaning elsewhere: synthetic/compat clicks after a touch tap (touchend
+  // reported already), modified clicks (shift keeps xterm's selection
+  // override), double/triple clicks (word/line selection), drag-selections,
+  // clicks on hovered links (activate() already handles the click — a second
+  // synthetic SGR press could e.g. dismiss a claude permission dialog),
+  // clicks outside the cell grid, and sessions where xterm's own encoder is
+  // live (it reported the click itself — a second report would double-move).
+  _handleDesktopTerminalClick(ev) {
+    if (!this.terminal || !ev?.isTrusted) return;
+    if (ev.button !== 0 || ev.detail !== 1) return;
+    if (ev.shiftKey || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+    const mode = this.terminal.modes?.mouseTrackingMode;
+    if (mode && mode !== 'none') return;
+    if (!this._sessionUsesServerMouseStrip()) return;
+    if (this.terminal.hasSelection?.()) return;
+    if (this._linkHovered) return; // link provider hover/leave callbacks (registerFilePathLinkProvider)
+    if (performance.now() <= (this._trustedTapMouseSuppressUntil || 0)) return;
+    if (!ev.target?.closest?.('.xterm-screen')) return;
+    this._sendSyntheticSgrTap(ev.clientX, ev.clientY);
   },
 
   _installMobileTapMouseGuard() {

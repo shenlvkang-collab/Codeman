@@ -162,7 +162,11 @@ html.mobile-init .file-browser-panel {
   }
 
   .case-select-group {
-    max-width: 150px;
+    max-width: none;
+  }
+
+  .case-combobox {
+    width: 160px;
   }
 
   .toolbar-select {
@@ -192,6 +196,27 @@ html.mobile-init .file-browser-panel {
      modal header with the close button stays visible */
   .modal {
     z-index: 1300;
+  }
+
+  .command-palette-modal {
+    padding: 10vh 0.75rem 0;
+  }
+
+  .command-palette-shell {
+    width: 100%;
+    max-height: 74vh;
+  }
+
+  .command-palette-input-row {
+    grid-template-columns: 20px minmax(0, 1fr);
+  }
+
+  .command-palette-input-row kbd {
+    display: none;
+  }
+
+  .command-palette-item {
+    min-height: 56px;
   }
 
   .modal-tabs {
@@ -434,14 +459,16 @@ html.mobile-init .file-browser-panel {
     height: 12px;
   }
 
-  /* Hide header settings gear, lifecycle log, and away digest on mobile - settings
-     moved to toolbar; away digest is a secondary informational control that doesn't
-     belong on the cramped phone header.
+  /* Hide header settings gear, lifecycle log, away digest, and session manager on
+     mobile - settings moved to toolbar; away digest and the session manager are
+     secondary controls that don't belong on the cramped phone header (the session
+     manager stays reachable via the Ctrl+K palette's "Browse all sessions" item).
      (The attachments button is opt-in / default-hidden everywhere via its own
      --hidden marker, so it needs no mobile-specific rule here.) */
   .btn-icon-header.btn-settings,
   .btn-icon-header.btn-lifecycle-log,
-  .btn-icon-header.btn-away-digest {
+  .btn-icon-header.btn-away-digest,
+  .btn-icon-header.btn-session-manager {
     display: none !important;
   }
 
@@ -1259,12 +1286,40 @@ html.mobile-init .file-browser-panel {
 
   .response-viewer {
     padding-bottom: var(--safe-area-bottom, 0px);
+    /* dvh tracks the visible viewport on iOS Safari (vh = large viewport and would clip
+       the header/close button off-screen); the vh line is the old-engine fallback */
+    max-height: 88vh;
+    max-height: 92dvh;
   }
 
   .response-viewer-body {
-    font-size: 12px;
-    padding: 12px;
+    font-size: 14.5px;
+    line-height: 1.65;
+    padding: 16px 16px 24px;
+    --rv-content-max: 100%;
   }
+
+  .response-viewer-body .rv-text pre,
+  .response-viewer-body pre {
+    /* Slightly smaller on mobile so diagrams fit better before scrolling */
+    padding: 12px 14px;
+    margin-left: -4px;
+    margin-right: -4px;
+    border-radius: 6px;
+  }
+
+  .response-viewer-body .rv-text pre code,
+  .response-viewer-body pre code {
+    font-size: 11.5px;
+    line-height: 1.5;
+  }
+
+  .response-viewer-body .rv-text h1,
+  .response-viewer-body > h1 { font-size: 1.35em; }
+  .response-viewer-body .rv-text h2,
+  .response-viewer-body > h2 { font-size: 1.2em; }
+  .response-viewer-body .rv-text h3,
+  .response-viewer-body > h3 { font-size: 1.08em; }
 
   /* Compact welcome overlay for mobile */
   .welcome-content {

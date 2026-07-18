@@ -309,6 +309,11 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsShowResponseViewer').checked = settings.showResponseViewer ?? defaults.showResponseViewer ?? false;
     document.getElementById('appSettingsShowAttachmentsButton').checked = settings.showAttachmentsButton ?? defaults.showAttachmentsButton ?? false;
     document.getElementById('appSettingsSkin').value = settings.skin ?? defaults.skin ?? 'daylight-blue';
+    // WebGL renderer (desktop only — mobile always uses the DOM renderer, so hide
+    // the toggle there so it can't promise something that won't apply).
+    document.getElementById('appSettingsWebglRenderer').checked = settings.webglRendererEnabled ?? defaults.webglRendererEnabled ?? true;
+    const webglItem = document.getElementById('appSettingsWebglRendererItem');
+    if (webglItem) webglItem.style.display = MobileDetection.getDeviceType() === 'desktop' ? '' : 'none';
     document.getElementById('appSettingsShowMonitor').checked = settings.showMonitor ?? defaults.showMonitor ?? false;
     document.getElementById('appSettingsShowProjectInsights').checked = settings.showProjectInsights ?? defaults.showProjectInsights ?? false;
     document.getElementById('appSettingsShowFileBrowser').checked = settings.showFileBrowser ?? defaults.showFileBrowser ?? false;
@@ -332,6 +337,8 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsTunnelEnabled').checked = settings.tunnelEnabled ?? false;
     this.loadTunnelStatus();
     document.getElementById('appSettingsLocalEcho').checked = settings.localEchoEnabled ?? MobileDetection.isTouchDevice();
+    document.getElementById('appSettingsTerminalWheelLocal').checked =
+      settings.terminalWheelLocalScrollback ?? defaults.terminalWheelLocalScrollback ?? false;
     document.getElementById('appSettingsCjkInput').checked = settings.cjkInputEnabled ?? defaults.cjkInputEnabled ?? false;
     document.getElementById('appSettingsExtendedKeyboardBar').checked = settings.extendedKeyboardBar ?? false;
     document.getElementById('appSettingsTabTwoRows').checked = settings.tabTwoRows ?? defaults.tabTwoRows ?? false;
@@ -466,6 +473,9 @@ Object.assign(CodemanApp.prototype, {
     modal.querySelectorAll('.modal-tab-content').forEach(content => {
       content.classList.toggle('hidden', content.id !== tabName);
     });
+    // The Shortcuts tab renders lazily so the list reflects the CURRENT
+    // registry (defaults + overrides) every time it is opened.
+    if (tabName === 'settings-shortcuts') this.renderShortcutSettingsList?.();
   },
 
   closeAppSettings() {
@@ -1400,6 +1410,9 @@ Object.assign(CodemanApp.prototype, {
     // only takes effect on reload — remember the prior value to decide below.
     const _prev = this.loadAppSettingsFromStorage();
     const _prevGestureEnabled = (_prev.gestureControlEnabled ?? false) === true;
+    // WebGL toggle: default ON (desktop), so only an explicit stored false counts
+    // as "previously off" — used below to detect a real OFF→ON flip.
+    const _prevWebglEnabled = (_prev.webglRendererEnabled ?? true) === true;
     const settings = {
       defaultClaudeMdPath: document.getElementById('appSettingsClaudeMdPath').value.trim(),
       defaultWorkingDir: document.getElementById('appSettingsDefaultDir').value.trim(),
@@ -1425,7 +1438,9 @@ Object.assign(CodemanApp.prototype, {
       imageWatcherEnabled: document.getElementById('appSettingsImageWatcherEnabled').checked,
       tunnelEnabled: document.getElementById('appSettingsTunnelEnabled').checked,
       localEchoEnabled: document.getElementById('appSettingsLocalEcho').checked,
+      terminalWheelLocalScrollback: document.getElementById('appSettingsTerminalWheelLocal').checked,
       cjkInputEnabled: document.getElementById('appSettingsCjkInput').checked,
+      webglRendererEnabled: document.getElementById('appSettingsWebglRenderer').checked,
       extendedKeyboardBar: document.getElementById('appSettingsExtendedKeyboardBar').checked,
       tabTwoRows: document.getElementById('appSettingsTabTwoRows').checked,
       skin: document.getElementById('appSettingsSkin').value,
@@ -1455,10 +1470,22 @@ Object.assign(CodemanApp.prototype, {
     // with no UI left to turn it back off. Preserve the prior stored preference.
     if (_prev.showTokenCount !== undefined) settings.showTokenCount = _prev.showTokenCount;
     if (_prev.showCost !== undefined) settings.showCost = _prev.showCost;
+    // Shortcut overrides are edited from the Shortcuts tab (not rebuilt from the
+    // general-settings DOM), so the fresh rebuild would drop them on every save.
+    if (_prev.shortcutOverrides !== undefined) settings.shortcutOverrides = _prev.shortcutOverrides;
 
     // Save to localStorage
     this.saveAppSettingsToStorage(settings);
     this._updateLocalEchoState();
+
+    // A real OFF→ON flip of the WebGL toggle retires the GPU-stall auto-fallback
+    // marker so the next reload actually re-tries WebGL. Only the transition
+    // clears it — an incidental save with the checkbox default-checked must NOT
+    // defeat the sticky safety net (shouldSkipWebGL treats stored true like the
+    // untouched default at page load).
+    if (!_prevWebglEnabled && settings.webglRendererEnabled) {
+      try { localStorage.removeItem('codeman-webgl-disabled'); } catch {}
+    }
 
     // Save voice settings to localStorage + include in server payload for cross-device sync
     const voiceSettings = {
@@ -1570,6 +1597,10 @@ Object.assign(CodemanApp.prototype, {
     // Strip device-specific DISPLAY keys so they never sync across devices —
     // localEcho/cjk/extendedKeyboard/skin are per-platform, and showPlanUsageLimits
     // is per-device too (desktop can show the usage chip while mobile stays hidden).
+    // webglRendererEnabled is per-device as well (renderer choice is GPU-specific,
+    // and syncing would leak mobile's hidden-checkbox false onto desktop); it's
+    // also absent from SettingsUpdateSchema, which is .strict() — sending it
+    // would 400 the whole settings PUT.
     // Telemetry COLLECTION is requested out-of-band via statusLineTelemetry (sent on
     // ENABLE only, so a device with the chip OFF never strips the exporter that
     // another device's chip depends on — see system-routes settings handler).
@@ -1580,6 +1611,8 @@ Object.assign(CodemanApp.prototype, {
       skin: _skin,
       showPlanUsageLimits: _pul,
       showAttachmentsButton: _ahb,
+      webglRendererEnabled: _wgl,
+      terminalWheelLocalScrollback: _twls,
       ...serverSettings
     } = settings;
     try {
@@ -1746,6 +1779,8 @@ Object.assign(CodemanApp.prototype, {
         ralphTrackerEnabled: false,
         tabTwoRows: false,
         cjkInputEnabled: false,
+        terminalWheelLocalScrollback: false, // mobile scrolls via touch, not wheel
+        webglRendererEnabled: false, // mobile always uses the DOM renderer
         skin: 'daylight-blue',
       };
     }
@@ -2118,7 +2153,8 @@ Object.assign(CodemanApp.prototype, {
           'showLifecycleLog', 'showResponseViewer', 'showRedrawButton',
           'showMonitor', 'showProjectInsights', 'showFileBrowser', 'showSubagents',
           'subagentActiveTabOnly', 'tabTwoRows', 'localEchoEnabled', 'cjkInputEnabled', 'extendedKeyboardBar',
-          'skin', 'showPlanUsageLimits', 'showAttachmentsButton',
+          'skin', 'showPlanUsageLimits', 'showAttachmentsButton', 'webglRendererEnabled',
+          'terminalWheelLocalScrollback',
         ]);
         // The plan-usage chip is a PER-DEVICE display setting (default OFF): desktop
         // can show it while mobile stays hidden. It used to sync, so an older
@@ -2361,6 +2397,138 @@ Object.assign(CodemanApp.prototype, {
       this.activeFocusTrap.deactivate();
       this.activeFocusTrap = null;
     }
+  },
+
+  // ─── Shortcut Settings (App Settings → Shortcuts tab) ────────────────────────
+  // Renders the list of shortcuts with capture buttons for key rebinding,
+  // and persists overrides under settings.shortcutOverrides (saved through
+  // saveAppSettingsToStorage so the device key + settings cache stay coherent).
+
+  renderShortcutSettingsList() {
+    const list = document.getElementById('appSettingsShortcutsList');
+    if (!list) return;
+    const registry = this.getShortcutRegistry
+      ? this.getShortcutRegistry()
+      : typeof DEFAULT_SHORTCUTS !== 'undefined'
+        ? DEFAULT_SHORTCUTS
+        : [];
+    const overrides = this.readShortcutOverridesFromSettings();
+    list.innerHTML = registry
+      .map((shortcut) => {
+        const bindingLabel = shortcut.displayBindings
+          ? shortcut.displayBindings.join(' / ')
+          : (shortcut.bindings || []).map((b) => [...(b.modifiers || []), b.key || b.code || ''].join('+')).join(' / ');
+        // Only registry entries dispatched through matchesShortcutEvent() are
+        // configurable; fixed keys (Escape, tab arrows, …) render read-only.
+        const configurable = !!shortcut.action && Array.isArray(shortcut.bindings);
+        const overridden = !!overrides[shortcut.id];
+        const controls = configurable
+          ? `<button type="button" class="shortcut-capture-btn" data-shortcut-action="capture" title="Capture new binding">Edit</button>
+        <button type="button" class="shortcut-reset-btn" data-shortcut-action="reset" title="Reset to default"${overridden ? '' : ' disabled'}>Reset</button>
+        <input class="shortcut-enabled-checkbox" type="checkbox" ${shortcut.disabled ? '' : 'checked'} data-shortcut-action="toggle" title="Enable/disable">`
+          : '';
+        return `<div class="shortcut-setting-row${configurable ? '' : ' shortcut-setting-row--fixed'}" data-shortcut-id="${escapeHtml(shortcut.id)}">
+        <label class="shortcut-setting-label">${escapeHtml(shortcut.label)}</label>
+        <input class="shortcut-binding-input" type="text" readonly value="${escapeHtml(bindingLabel)}" placeholder="(none)" data-id="${escapeHtml(shortcut.id)}">
+        ${controls}
+      </div>`;
+      })
+      .join('');
+    this._wireShortcutSettingsList(list);
+  },
+
+  // Delegated handlers (no inline onclick — registry ids never land inside a
+  // JS string context, and the listeners survive re-renders).
+  _wireShortcutSettingsList(list) {
+    if (list.dataset.shortcutListenersAdded) return;
+    list.dataset.shortcutListenersAdded = 'true';
+    list.addEventListener('click', (e) => {
+      const btn = e.target?.closest?.('[data-shortcut-action]');
+      if (!btn) return;
+      const id = btn.closest?.('[data-shortcut-id]')?.dataset?.shortcutId;
+      if (!id) return;
+      if (btn.dataset.shortcutAction === 'capture') this.startShortcutCapture(id);
+      else if (btn.dataset.shortcutAction === 'reset') this.resetShortcutOverride(id);
+    });
+    list.addEventListener('change', (e) => {
+      const box = e.target;
+      if (!box?.matches?.('[data-shortcut-action="toggle"]')) return;
+      const id = box.closest?.('[data-shortcut-id]')?.dataset?.shortcutId;
+      if (id) this.toggleShortcutEnabled(id, box.checked);
+    });
+  },
+
+  readShortcutOverridesFromSettings() {
+    const settings = this.loadAppSettingsFromStorage();
+    return settings.shortcutOverrides || {};
+  },
+
+  startShortcutCapture(shortcutId) {
+    const input = document.querySelector(`.shortcut-binding-input[data-id="${shortcutId}"]`);
+    if (!input) return;
+    input.value = 'Press keys…';
+    input.focus();
+    this._capturingShortcutId = shortcutId;
+    // Persistent listener (NOT {once}) — the first keydown of a combo like
+    // Ctrl+Shift+P is the modifier itself ('Control'), which must not end the
+    // capture. The first non-modifier key completes it.
+    const onCaptureKeydown = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Control' || e.key === 'Shift' || e.key === 'Alt' || e.key === 'Meta') return;
+      input.removeEventListener('keydown', onCaptureKeydown);
+      this.onShortcutCaptureKeydown(e, shortcutId);
+    };
+    input.addEventListener('keydown', onCaptureKeydown);
+  },
+
+  onShortcutCaptureKeydown(e, shortcutId) {
+    e.preventDefault();
+    e.stopPropagation();
+    this._capturingShortcutId = null;
+    if (e.key === 'Escape') {
+      this.renderShortcutSettingsList();
+      return;
+    }
+    // Require a real chord: the dispatcher has no focus-target guard, so a
+    // bare-key binding would fire while typing in any input.
+    if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+      this.renderShortcutSettingsList();
+      this.showToast?.('Shortcut must include Ctrl, Cmd, or Alt', 'error');
+      return;
+    }
+    const modifiers = [];
+    if (e.ctrlKey) modifiers.push('ctrl');
+    if (e.metaKey) modifiers.push('meta');
+    if (e.shiftKey) modifiers.push('shift');
+    if (e.altKey) modifiers.push('alt');
+    const settings = this.loadAppSettingsFromStorage();
+    const shortcutOverrides = { ...(settings.shortcutOverrides || {}) };
+    shortcutOverrides[shortcutId] = {
+      ...(shortcutOverrides[shortcutId] || {}),
+      bindings: [{ modifiers, key: e.key, code: e.code }],
+    };
+    settings.shortcutOverrides = shortcutOverrides;
+    this.saveAppSettingsToStorage(settings);
+    this.renderShortcutSettingsList();
+  },
+
+  resetShortcutOverride(shortcutId) {
+    const settings = this.loadAppSettingsFromStorage();
+    const shortcutOverrides = { ...(settings.shortcutOverrides || {}) };
+    delete shortcutOverrides[shortcutId];
+    settings.shortcutOverrides = shortcutOverrides;
+    this.saveAppSettingsToStorage(settings);
+    this.renderShortcutSettingsList();
+  },
+
+  toggleShortcutEnabled(shortcutId, enabled) {
+    const settings = this.loadAppSettingsFromStorage();
+    const shortcutOverrides = { ...(settings.shortcutOverrides || {}) };
+    shortcutOverrides[shortcutId] = { ...(shortcutOverrides[shortcutId] || {}), disabled: !enabled };
+    settings.shortcutOverrides = shortcutOverrides;
+    this.saveAppSettingsToStorage(settings);
+    this.renderShortcutSettingsList();
   },
 
   closeAllPanels() {

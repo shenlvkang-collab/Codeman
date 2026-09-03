@@ -50,11 +50,13 @@ import {
   type EffortLevel,
   type GeminiConfig,
   type SessionRemote,
+  type SessionNameSource,
 } from './types.js';
 import type { TerminalMultiplexer, MuxSession } from './mux-interface.js';
 import { TaskTracker, type BackgroundTask } from './task-tracker.js';
 import { RalphTracker } from './ralph-tracker.js';
 import { BashToolParser } from './bash-tool-parser.js';
+import { isGeneratedSessionName, SubmittedPromptTracker } from './session-auto-name.js';
 import {
   BufferAccumulator,
   ANSI_ESCAPE_PATTERN_FULL,
@@ -291,6 +293,8 @@ export class Session extends EventEmitter {
   private _taskCache = new SessionTaskCache();
 
   private _name: string;
+  private _nameSource: SessionNameSource;
+  private readonly _submittedPromptTracker = new SubmittedPromptTracker();
   private ptyProcess: pty.IPty | null = null;
   private _pid: number | null = null;
   private _status: SessionStatus = 'idle';
@@ -444,6 +448,8 @@ export class Session extends EventEmitter {
       workingDir: string;
       mode?: SessionMode;
       name?: string;
+      /** Whether the current name is still eligible for automatic replacement. */
+      nameSource?: SessionNameSource;
       /** Terminal multiplexer instance (tmux) */
       mux?: TerminalMultiplexer;
       /** Whether to use multiplexer wrapping */
@@ -491,6 +497,8 @@ export class Session extends EventEmitter {
     this.createdAt = config.createdAt || Date.now();
     this.mode = config.mode || 'claude';
     this._name = config.name || '';
+    this._nameSource =
+      config.nameSource ?? (!this._name || isGeneratedSessionName(this._name) ? 'auto' : 'manual');
     this._resumeSessionId = config.resumeSessionId;
     this._lastActivityAt = this.createdAt;
     // Set claudeSessionId — when resuming, the Claude conversation ID is the resumed one.
@@ -894,6 +902,19 @@ export class Session extends EventEmitter {
 
   set name(value: string) {
     this._name = value;
+    this._nameSource = 'manual';
+  }
+
+  /** Replace an automatically generated name without taking ownership from auto naming. */
+  applyAutoName(value: string): boolean {
+    const name = value.trim();
+    if (!name || this._nameSource !== 'auto' || this._name === name) return false;
+    this._name = name;
+    return true;
+  }
+
+  get nameSource(): SessionNameSource {
+    return this._nameSource;
   }
 
   setAutoClear(enabled: boolean, threshold?: number): void {
@@ -1012,6 +1033,7 @@ export class Session extends EventEmitter {
       createdAt: this.createdAt,
       lastActivityAt: this._lastActivityAt,
       name: this._name,
+      nameSource: this._nameSource,
       mode: this.mode,
       autoClearEnabled: this._autoOps.autoClearEnabled,
       autoClearThreshold: this._autoOps.autoClearThreshold,
@@ -2354,9 +2376,10 @@ export class Session extends EventEmitter {
    * ```
    */
   write(data: string): void {
-    this._trackCodexSubmit(data);
+    const submittedPrompts = this._trackSubmittedPrompt(data);
     if (this.ptyProcess) {
       this.ptyProcess.write(data);
+      this._emitSubmittedPrompt(submittedPrompts);
     }
   }
 
@@ -2374,6 +2397,17 @@ export class Session extends EventEmitter {
   private _trackCodexSubmit(data: string): void {
     if (this.mode === 'codex' && (data.includes('\r') || data.includes('\n'))) {
       this._codexLastSubmitAt = Date.now();
+    }
+  }
+
+  private _trackSubmittedPrompt(data: string): string[] {
+    this._trackCodexSubmit(data);
+    return this._submittedPromptTracker.feed(data);
+  }
+
+  private _emitSubmittedPrompt(prompts: string[]): void {
+    for (const prompt of prompts) {
+      this.emit('promptSubmitted', prompt);
     }
   }
 
@@ -2430,13 +2464,16 @@ export class Session extends EventEmitter {
    * ```
    */
   async writeViaMux(data: string): Promise<boolean> {
-    this._trackCodexSubmit(data);
+    const submittedPrompts = this._trackSubmittedPrompt(data);
     if (this._mux && this._muxSession) {
-      return this._mux.sendInput(this.id, data);
+      const sent = await this._mux.sendInput(this.id, data);
+      if (sent) this._emitSubmittedPrompt(submittedPrompts);
+      return sent;
     }
     // Fallback to PTY write
     if (this.ptyProcess) {
       this.ptyProcess.write(data);
+      this._emitSubmittedPrompt(submittedPrompts);
       return true;
     }
     return false;

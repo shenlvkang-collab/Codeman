@@ -43,6 +43,9 @@ export type ClaudeMode = 'dangerously-skip-permissions' | 'normal' | 'allowedToo
 /** Session mode: which CLI backend a session runs */
 export type SessionMode = 'claude' | 'shell' | 'opencode' | 'codex' | 'gemini';
 
+/** Whether a session name may still be replaced by the first submitted prompt. */
+export type SessionNameSource = 'auto' | 'manual';
+
 export type RemoteCommandMode = Extract<SessionMode, 'shell' | 'claude' | 'opencode' | 'codex' | 'gemini'>;
 
 /**
@@ -225,6 +228,8 @@ export interface SessionState {
   lastActivityAt: number;
   /** Session display name */
   name?: string;
+  /** Name ownership; auto names are replaced after the first real prompt. */
+  nameSource?: SessionNameSource;
   /** Session mode */
   mode?: SessionMode;
   /** Auto-clear enabled */

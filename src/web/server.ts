@@ -1395,6 +1395,7 @@ export class WebServer extends EventEmitter {
       getStore: () => this.store,
       registerAttachment: (id: string, filePath: string, source: 'external' | 'codex-generated') =>
         this.registerAttachment(id, filePath, source),
+      updateSessionName: (id: string, name: string) => this.mux.updateSessionName(id, name),
     };
   }
 
@@ -2428,6 +2429,7 @@ export class WebServer extends EventEmitter {
               workingDir: muxSession.workingDir,
               mode: muxSession.mode,
               name: sessionName,
+              nameSource: savedState?.nameSource,
               mux: this.mux,
               useMux: true,
               muxSession: muxSession, // Pass the existing session so startInteractive() can attach to it

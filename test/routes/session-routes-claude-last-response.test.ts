@@ -111,6 +111,82 @@ describe('GET /api/sessions/:id/last-response (claude)', () => {
     return { response, body: JSON.parse(response.body) };
   }
 
+  it('includes every recorded conversation after resume or clear, without scanning sibling sessions', async () => {
+    const session = harness.ctx._session;
+    session.mode = 'claude';
+    session.claudeSessionId = 'current';
+    session.claudeSessionChain = ['original', 'missing', 'current'];
+    writeTranscript('original', [userEntry('old question'), assistantEntry('old detail', 't1')]);
+    writeTranscript('current', [userEntry('new question'), assistantEntry('new detail', 't2')]);
+    writeTranscript('sibling', [assistantEntry('private sibling answer', 't3')]);
+    const { body } = await getLastResponse(session.id, true);
+    expect(body.data.messages.map((m: { text: string }) => m.text)).toEqual([
+      'old question',
+      'old detail',
+      'new question',
+      'new detail',
+    ]);
+    expect(body.data.messages[2].turn).toBeGreaterThan(body.data.messages[1].turn);
+    expect(body.data.text).toBe('new detail');
+    const brief = await getLastResponse(session.id);
+    expect(brief.body.data).toEqual({ text: 'new detail', timestamp: 't2' });
+  });
+
+  it('deduplicates replayed UUIDs across files but preserves distinct identical replies', async () => {
+    const session = harness.ctx._session;
+    session.claudeSessionId = 'current';
+    session.claudeSessionChain = ['original', 'current'];
+    const reply = { ...assistantEntry('Same words', 't1'), uuid: 'reply-1' };
+    writeTranscript('original', [userEntry('question'), reply]);
+    writeTranscript('current', [reply, { ...reply, uuid: 'reply-2' }, { ...reply, uuid: 'reply-3' }]);
+    const { body } = await getLastResponse(session.id, true);
+    expect(body.data.messages.filter((m: { role: string }) => m.role === 'assistant')).toHaveLength(3);
+  });
+
+  it('reads the exact hook transcript when resume stores it outside the default root', async () => {
+    const session = harness.ctx._session;
+    const project = join(testHome, 'other-account', 'projects', 'moved-workspace');
+    mkdirSync(project, { recursive: true });
+    const path = join(project, 'resumed.jsonl');
+    const markdown = '## Result\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\n```ts\nconst x = 1;\n```';
+    writeFileSync(path, JSON.stringify(assistantEntry(markdown, 't')));
+    harness.ctx.getTranscriptPath = vi.fn(() => path);
+    const { body } = await getLastResponse(session.id, true);
+    expect(body.data.messages[0].text).toBe(markdown);
+    expect(session.claudeSessionId).toBe('resumed');
+  });
+
+  it('uses the process and per-session config roots without mixing accounts', async () => {
+    const session = harness.ctx._session;
+    session.claudeSessionId = session.id;
+    writeTranscript(session.id, [assistantEntry('wrong account', 't')]);
+    const root = join(testHome, 'relocated');
+    const project = join(root, 'projects', 'project');
+    mkdirSync(project, { recursive: true });
+    writeFileSync(join(project, `${session.id}.jsonl`), JSON.stringify(assistantEntry('right account', 't')));
+    vi.stubEnv('CLAUDE_CONFIG_DIR', root);
+    try {
+      expect((await getLastResponse(session.id, true)).body.data.text).toBe('right account');
+      vi.stubEnv('CLAUDE_CONFIG_DIR', join(testHome, 'missing-account'));
+      Object.defineProperty(session, 'claudeConfigDir', { value: root, configurable: true });
+      expect((await getLastResponse(session.id, true)).body.data.text).toBe('right account');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('refreshes cached transcripts after appends and keeps history when the current file is not written yet', async () => {
+    const session = harness.ctx._session;
+    session.claudeSessionId = 'current';
+    session.claudeSessionChain = ['original', 'current'];
+    writeTranscript('original', [assistantEntry('before resume', 't1')]);
+    expect((await getLastResponse(session.id, true)).body.data.messages).toHaveLength(1);
+    writeTranscript('current', [assistantEntry('intermediate detail', 't2')]);
+    expect((await getLastResponse(session.id, true)).body.data.messages).toHaveLength(2);
+    writeTranscript('current', [assistantEntry('intermediate detail', 't2'), assistantEntry('final answer', 't3')]);
+    expect((await getLastResponse(session.id, true)).body.data.messages).toHaveLength(3);
+  });
+
   it('recovers a placeholder tmux session by UUID prefix and renders one message per model message', async () => {
     const restoredId = 'restored-40568a29';
     const conversationId = '40568a29-d4eb-4eb6-b671-8401428e4f39';

@@ -1248,6 +1248,11 @@ export class Session extends EventEmitter {
     return this._claudeSessionChain;
   }
 
+  /** Only the transcript location, never the session's credential-bearing env map. */
+  get claudeConfigDir(): string | undefined {
+    return this._claudeConfigDir();
+  }
+
   /** Docker execution metadata when this session runs inside a container, else undefined. */
   get docker(): SessionDocker | undefined {
     return this._docker;

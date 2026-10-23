@@ -7,7 +7,6 @@
 import { FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { join, dirname, extname, basename, resolve as resolvePath } from 'node:path';
-import { homedir } from 'node:os';
 import { existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
@@ -167,6 +166,7 @@ import type {
   KeepWarmPort,
 } from '../ports/index.js';
 import { RunSummaryTracker } from '../../run-summary.js';
+import { claudeProjectsDir } from '../../utils/claude-transcript.js';
 
 import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal-limits.js';
 import { MAX_PASTE_IMAGE_BYTES, MAX_PASTE_VIDEO_BYTES } from '../../config/buffer-limits.js';
@@ -2559,7 +2559,7 @@ export function registerSessionRoutes(
       if (s.lastSubmitAt) otherSubmits.push(s.lastSubmitAt);
     }
 
-    const historyPath = join(homedir(), '.claude', 'history.jsonl');
+    const historyPath = join(projectsDir, '..', 'history.jsonl');
     const stat = await fs.stat(historyPath).catch(() => null);
     if (!stat || stat.size === 0) return null;
     const tail = await readFileTail(historyPath, Buffer.alloc(CLAUDE_HISTORY_TAIL_BYTES), stat.size);
@@ -2609,6 +2609,7 @@ export function registerSessionRoutes(
   }
 
   interface ClaudeResponseMessage {
+    id?: string;
     kind: 'prompt' | 'response';
     label: 'Prompt' | 'Response';
     role: 'user' | 'assistant';
@@ -2619,6 +2620,7 @@ export function registerSessionRoutes(
   }
 
   interface ClaudeTranscriptEntry {
+    uuid?: string;
     type?: string;
     timestamp?: string;
     isMeta?: boolean;
@@ -2686,14 +2688,16 @@ export function registerSessionRoutes(
     // concatenating it into the previous card.
     const currentUserFragments = new Set<string>();
     const currentAssistantFragments = new Set<string>();
+    const seenIds = new Set<string>();
     // Turn 0 is reserved for anything emitted before the first human prompt.
     let turn = 0;
 
-    const pushUserMessage = (text: string, timestamp: string | undefined, queued: boolean): void => {
+    const pushUserMessage = (text: string, timestamp: string | undefined, queued: boolean, id?: string): void => {
       // A run of consecutive human inputs (a mid-turn queued burst) is ONE turn,
       // so the viewer renders it under one badge instead of one badge per line.
       if (messages.at(-1)?.role !== 'user') turn += 1;
       const message: ClaudeResponseMessage = { kind: 'prompt', label: 'Prompt', role: 'user', text, timestamp, turn };
+      if (id) message.id = id;
       if (queued) message.queued = true;
       messages.push(message);
       currentUserFragments.add(text);
@@ -2711,6 +2715,10 @@ export function registerSessionRoutes(
       // Sidechains belong to agents/forks, not the main conversation. Meta user
       // rows include repeated image dimensions and other UI-generated context.
       if (entry.isSidechain) continue;
+      if (entry.uuid) {
+        if (seenIds.has(entry.uuid)) continue;
+        seenIds.add(entry.uuid);
+      }
 
       // A prompt typed while Claude is working is absorbed mid-turn and lives
       // ONLY in an attachment row, so it was lost outright. `origin.kind` and
@@ -2727,8 +2735,8 @@ export function registerSessionRoutes(
         if (queued.origin?.kind !== 'human' || queued.commandMode !== 'prompt') continue;
         const text = typeof queued.prompt === 'string' ? queued.prompt.trim() : '';
         if (!text || isClaudeSyntheticUserMessage(entry, text)) continue;
-        if (currentUserFragments.has(text)) continue;
-        pushUserMessage(text, queued.timestamp || entry.timestamp, true);
+        if (!entry.uuid && currentUserFragments.has(text)) continue;
+        pushUserMessage(text, queued.timestamp || entry.timestamp, true, entry.uuid);
         continue;
       }
 
@@ -2741,8 +2749,8 @@ export function registerSessionRoutes(
         // a CLI that also wrote an absorbed prompt as a user row would double it.
         // Both collapse here. The same prompt sent again AFTER a reply is a
         // legitimate second turn, because that reply cleared the set.
-        if (currentUserFragments.has(text)) continue;
-        pushUserMessage(text, entry.timestamp, false);
+        if (!entry.uuid && currentUserFragments.has(text)) continue;
+        pushUserMessage(text, entry.timestamp, false, entry.uuid);
         continue;
       }
 
@@ -2754,13 +2762,41 @@ export function registerSessionRoutes(
       if (!full) continue;
 
       // Replayed snapshots repeat an identical text block inside one turn.
-      if (currentAssistantFragments.has(text)) continue;
-      messages.push({ kind: 'response', label: 'Response', role: 'assistant', text, timestamp: entry.timestamp, turn });
+      if (!entry.uuid && currentAssistantFragments.has(text)) continue;
+      messages.push({
+        kind: 'response',
+        label: 'Response',
+        role: 'assistant',
+        text,
+        timestamp: entry.timestamp,
+        turn,
+        ...(entry.uuid ? { id: entry.uuid } : {}),
+      });
       currentAssistantFragments.add(text);
       currentUserFragments.clear();
     }
 
     return full ? { text: lastText, timestamp: lastTimestamp, messages } : { text: lastText, timestamp: lastTimestamp };
+  }
+
+  // Polling an open viewer should not repeatedly parse the API/tool payloads in
+  // an unchanged transcript. Keep only rendered messages, not the source JSONL.
+  const claudeResponseCache = new LRUMap<
+    string,
+    {
+      size: number;
+      mtimeMs: number;
+      parsed: ReturnType<typeof parseClaudeResponseTranscript>;
+    }
+  >({ maxSize: 16 });
+
+  async function readClaudeResponses(path: string): Promise<ReturnType<typeof parseClaudeResponseTranscript>> {
+    const stat = await fs.stat(path);
+    const cached = claudeResponseCache.get(path);
+    if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.parsed;
+    const parsed = parseClaudeResponseTranscript(await fs.readFile(path, 'utf8'), true);
+    claudeResponseCache.set(path, { size: stat.size, mtimeMs: stat.mtimeMs, parsed });
+    return parsed;
   }
 
   /**
@@ -2909,8 +2945,10 @@ export function registerSessionRoutes(
       };
     }
 
-    // Scan ~/.claude/projects/*/ for the transcript file
-    const projectsDir = join(process.env.HOME || '/tmp', '.claude', 'projects');
+    // Hooks identify the exact transcript, including relocated config directories.
+    // Without a hook, use the same config root as the CLI's resume lookup.
+    const hookPath = ctx.getTranscriptPath(session.id);
+    const projectsDir = hookPath ? dirname(dirname(hookPath)) : claudeProjectsDir(session.claudeConfigDir);
 
     // Adopt the current conversation id if the user ran `/clear` — Claude CLI's
     // interactive PTY emits no JSON on stdout, so without this lookup the
@@ -2937,13 +2975,15 @@ export function registerSessionRoutes(
     // stays the last assistant row in every mode (agent pollers hash it).
     const wantsMessages = query.context === 'full' || query.context === 'turn';
     const claudeSessionId = session.claudeSessionId || session.id;
-    const transcript = await findClaudeTranscript(projectsDir, claudeSessionId, session.id);
-    if (!transcript) {
-      return wantsMessages ? { text: '', timestamp: '', messages: [] } : { text: '', timestamp: '' };
-    }
+    const hookStat = hookPath ? await fs.stat(hookPath).catch(() => null) : null;
+    const transcript =
+      hookPath && hookStat?.isFile()
+        ? { sessionId: basename(hookPath, '.jsonl'), path: hookPath }
+        : await findClaudeTranscript(projectsDir, claudeSessionId, session.id);
 
-    if (transcript.sessionId !== session.claudeSessionId && transcript.sessionId !== session.id) {
+    if (transcript && transcript.sessionId !== session.claudeSessionId && transcript.sessionId !== session.id) {
       session.adoptClaudeSessionId(transcript.sessionId);
+      ctx.persistSessionState(session);
       if (session.docker) {
         void persistDockerCaseClaudeSessionId(
           CODEMAN_CONFIG_DIR,
@@ -2954,8 +2994,42 @@ export function registerSessionRoutes(
     }
 
     try {
-      const content = await fs.readFile(transcript.path, 'utf8');
-      const parsed = parseClaudeResponseTranscript(content, wantsMessages);
+      // /clear and interactive resume can rotate the transcript inside a live
+      // tab. The recorded chain is a binding to THIS pane, unlike cwd/mtime.
+      const ids =
+        query.context === 'full'
+          ? [...new Set([...(session.claudeSessionChain ?? []), ...(transcript ? [transcript.sessionId] : [])])]
+          : transcript
+            ? [transcript.sessionId]
+            : [];
+      const messages: ClaudeResponseMessage[] = [];
+      const seenIds = new Set<string>();
+      let text = '';
+      let timestamp = '';
+      let turnOffset = 0;
+      for (const conversationId of ids) {
+        const file =
+          conversationId === transcript?.sessionId
+            ? transcript
+            : await findClaudeTranscript(projectsDir, conversationId, conversationId);
+        if (!file) continue;
+        const part = await readClaudeResponses(file.path).catch(() => null);
+        if (!part) continue;
+        if (part.text) {
+          text = part.text;
+          timestamp = part.timestamp;
+        }
+        let lastTurn = turnOffset;
+        for (const message of part.messages ?? []) {
+          if (message.id && seenIds.has(message.id)) continue;
+          if (message.id) seenIds.add(message.id);
+          const turn = message.turn + turnOffset;
+          messages.push({ ...message, turn });
+          lastTurn = Math.max(lastTurn, turn);
+        }
+        turnOffset = lastTurn + 1;
+      }
+      const parsed = { text, timestamp, ...(wantsMessages ? { messages } : {}) };
       if (query.context === 'turn') {
         return {
           text: parsed.text,

@@ -3073,12 +3073,27 @@ class CodemanApp {
 
     const isOpen = viewer.classList.contains('visible');
     if (isOpen) {
+      this._responseViewerGeneration = (this._responseViewerGeneration || 0) + 1;
+      clearTimeout(this._responseViewerTimer);
+      this._responseViewerAbort?.abort();
       viewer.classList.remove('visible');
       backdrop.classList.remove('visible');
       return;
     }
 
     if (!this.activeSessionId) return;
+    if (this.sessions.get(this.activeSessionId)?.mode === 'claude') {
+      const generation = this._responseViewerGeneration = (this._responseViewerGeneration || 0) + 1;
+      this._responseViewerSessionId = this.activeSessionId;
+      this._responseViewerMessages = [];
+      document.getElementById('responseViewerBody').textContent = 'Loading conversation...';
+      document.getElementById('responseViewerTitle').textContent = 'Conversation';
+      document.getElementById('responseViewerMore').style.display = 'none';
+      viewer.classList.add('visible');
+      backdrop.classList.add('visible');
+      await this._refreshClaudeResponseHistory(generation, true);
+      return;
+    }
     try {
       // Source 1: Transcript JSONL (best quality — clean structured text from Claude).
       // `context=turn` asks for the last ANSWERED turn as messages: a Claude
@@ -3157,6 +3172,70 @@ class CodemanApp {
       body.scrollTop = turnMessages.length > 1 ? body.scrollHeight : 0;
     } catch (err) {
       console.error('Failed to load response:', err);
+    }
+  }
+
+  async _refreshClaudeResponseHistory(generation, initial = false) {
+    const viewer = document.getElementById('responseViewer');
+    if (generation !== this._responseViewerGeneration || !viewer?.classList.contains('visible')) return;
+    const sessionId = this._responseViewerSessionId;
+    // Pin the overlay to the session it opened for. A late fetch or a tab switch
+    // must never put one conversation's messages under another session's badge.
+    if (sessionId !== this.activeSessionId) {
+      this.toggleResponseViewer();
+      return;
+    }
+    const controller = new AbortController();
+    this._responseViewerAbort = controller;
+    const deadline = setTimeout(() => controller.abort(), 30000);
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/last-response?context=full`, { signal: controller.signal });
+      if (res.ok === false) throw new Error(`History request failed (${res.status})`);
+      const payload = await res.json();
+      if (payload?.success === false) throw new Error('History request failed');
+      if (generation !== this._responseViewerGeneration || sessionId !== this.activeSessionId) return;
+      const data = payload?.data ?? {};
+      const messages = (Array.isArray(data.messages) ? data.messages : []).filter(
+        (msg) => msg && (msg.role === 'user' || msg.role === 'assistant') && typeof msg.text === 'string' && msg.text.trim()
+      );
+      // Compatibility with a server that still returns only the final text.
+      if (!messages.length && data.text) messages.push({ role: 'assistant', text: data.text });
+      const body = document.getElementById('responseViewerBody');
+      const previous = this._responseViewerMessages || [];
+      if (!messages.length && previous.length) throw new Error('Transcript temporarily unavailable');
+      const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+      const scrollTop = body.scrollTop;
+      let common = 0;
+      while (common < previous.length && common < messages.length &&
+             JSON.stringify(previous[common]) === JSON.stringify(messages[common])) common++;
+      // Keep unchanged DOM (selection, expanded code blocks and reading position)
+      // and append only new segments. Never concatenate overlapping screen dumps.
+      if (!common) body.replaceChildren();
+      else while (body.children.length > common) body.lastElementChild.remove();
+      for (let i = common; i < messages.length; i++) {
+        const msg = messages[i];
+        const prev = messages[i - 1];
+        const continuation = !!prev && prev.role === msg.role && typeof msg.turn === 'number' && prev.turn === msg.turn;
+        body.appendChild(this._buildResponseViewerMessage(msg.text, msg.role, 'Claude', { ...msg, continuation }));
+      }
+      if (!messages.length) body.textContent = 'No conversation history available yet. Waiting for the transcript...';
+      if (common < messages.length) this._bindResponseViewerInteractions(body);
+      this._responseViewerMessages = messages;
+      const turns = new Set(messages.filter((msg) => typeof msg.turn === 'number').map((msg) => msg.turn)).size;
+      document.getElementById('responseViewerTitle').textContent = turns
+        ? `Conversation (${messages.length} messages, ${turns} turns)`
+        : `Conversation (${messages.length} messages)`;
+      body.scrollTop = initial || atBottom ? body.scrollHeight : scrollTop;
+    } catch (err) {
+      if (generation !== this._responseViewerGeneration) return;
+      console.error('Failed to refresh conversation:', err);
+      document.getElementById('responseViewerTitle').textContent = 'Conversation (reconnecting...)';
+      if (initial) document.getElementById('responseViewerBody').textContent = 'Could not load conversation. Retrying...';
+    } finally {
+      clearTimeout(deadline);
+      if (generation === this._responseViewerGeneration && viewer.classList.contains('visible')) {
+        this._responseViewerTimer = setTimeout(() => this._refreshClaudeResponseHistory(generation), 5000);
+      }
     }
   }
 
@@ -9517,6 +9596,9 @@ class CodemanApp {
   }
 
   async selectSession(sessionId, options = {}) {
+    if (sessionId !== this.activeSessionId && document.getElementById('responseViewer')?.classList.contains('visible')) {
+      this.toggleResponseViewer();
+    }
     // Picking another tab yourself retires a `#session=<id>` link still
     // waiting for its session, which would otherwise take the tab from you
     // whenever that session turned up (see _selectUrlSession).

@@ -107,9 +107,10 @@ The defaults you will care about, all under **App Settings**:
 
 **Separate Claude accounts per session.** Set `CLAUDE_CONFIG_DIR` in a session's environment
 overrides to point it at a different Claude config directory, which is how you run one
-session on a client's subscription and another on your own. One caveat: a relocated config
-directory writes transcripts outside `~/.claude/projects`, which blinds the response viewer,
-subagent windows, ultracode panel, and Read My Mind for that session. Symlink `projects`
+session on a client's subscription and another on your own. The response viewer follows
+that config directory (or the exact transcript path reported by Claude's hooks). Other
+watchers, including subagent windows, ultracode panel, and Read My Mind, may still need
+the shared project tree. Symlink `projects`
 back into the shared tree to keep them working:
 
 ```bash

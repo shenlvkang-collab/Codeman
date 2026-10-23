@@ -100,11 +100,25 @@ The design target is 20 sessions and 50 agent windows at 60fps. If you routinely
 than that, expect the browser rather than the server to be the limit, and close windows you
 are not reading.
 
+## Claude conversation history
+
+The Response Viewer opens the full conversation, including intermediate assistant
+messages and prompts queued while Claude was working. It reads structured Claude
+transcripts, preserving Markdown tables, lists and code blocks without relying on
+terminal scrollback. When a tab has recorded multiple conversations through resume
+or `/clear`, its history includes those transcripts in order. Missing transcript
+files cannot be reconstructed from the terminal.
+
+While open, the viewer checks for new messages every five seconds. It follows new
+output when you are at the bottom and keeps your position when you scroll up to
+read older messages. Closing it or switching tabs stops the refresh. A transcript
+that is not available yet is retried rather than replaced with raw terminal text.
+
 ## Gotchas
 
 - **A session pointed at a relocated Claude config directory goes blind here.** Transcripts
   written outside `~/.claude/projects` are invisible to the watchers, so subagent windows,
-  the ultracode panel, the response viewer, and Read My Mind all stop working for that
+  the ultracode panel, and Read My Mind can stop working for that
   session. Symlink `projects` back into the shared tree to fix it. See
   [Agent CLIs](Agent-CLIs).
 - **Closing a window does not cancel the agent.** Nothing on this page controls agents; it

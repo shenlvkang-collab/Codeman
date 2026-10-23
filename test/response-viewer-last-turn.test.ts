@@ -1,22 +1,7 @@
 /**
- * @fileoverview The brief ("Last Response") view renders the last ANSWERED turn.
- *
- * `data.text` is one row — the last assistant row — and a Claude turn is a
- * median of 3 rows, so the eye button used to show the tail of an answer
- * ("Done.") while the More view showed the whole thing. The brief view now asks
- * for `context=turn` and renders those rows the way the full view does: one
- * badge, then continuation segments. Pinned here:
- *
- *  1. `selectLastAnsweredTurn` picks the highest turn that HAS an assistant
- *     message, so a prompt queued after the answer (a new, unanswered turn)
- *     does not blank the view; and it yields nothing without numeric turns.
- *  2. The brief view falls back to `text` when the server sends no messages
- *     (Codex, the pane parser, an older server), so those keep their one card.
- *  3. The continuation gate is the numeric `turn`, as in loadFullContext.
- *
- * app.js is loaded via `vm` with a jsdom document, as in
- * response-viewer-turn-segments.test.ts.
- * Port: N/A
+ * Claude opens a complete, refreshing transcript; the last-turn selector remains
+ * available to API consumers. Exercise history preservation, live appends,
+ * reader scroll position, delayed transcripts and stale request isolation.
  */
 import { readFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
@@ -57,7 +42,7 @@ describe('selectLastAnsweredTurn', () => {
   });
 });
 
-describe('response viewer brief view (last answered turn)', () => {
+describe('Claude response viewer history', () => {
   const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
   const { document, NodeFilter } = dom.window;
 
@@ -74,6 +59,7 @@ describe('response viewer brief view (last answered turn)', () => {
       requestAnimationFrame: vi.fn(),
       HTMLCanvasElement: class HTMLCanvasElement {},
       fetch: vi.fn(),
+      AbortController,
       document,
       NodeFilter,
       localStorage: { length: 0, key: vi.fn(), getItem: vi.fn(), setItem: vi.fn(), removeItem: vi.fn() },
@@ -88,6 +74,8 @@ describe('response viewer brief view (last answered turn)', () => {
 
   interface ViewerApp {
     toggleResponseViewer(): Promise<void>;
+    _refreshClaudeResponseHistory(generation: number, initial?: boolean): Promise<void>;
+    _responseViewerGeneration: number;
     activeSessionId?: string;
     sessions?: Map<string, { mode: string }>;
   }
@@ -108,6 +96,9 @@ describe('response viewer brief view (last answered turn)', () => {
   }
 
   function makeApp(payload: unknown): { app: ViewerApp; fetchMock: ReturnType<typeof vi.fn> } {
+    vi.useFakeTimers();
+    (appContext as { setTimeout: unknown }).setTimeout = setTimeout;
+    (appContext as { clearTimeout: unknown }).clearTimeout = clearTimeout;
     const app = Object.create(CodemanApp.prototype) as ViewerApp;
     app.activeSessionId = 's1';
     app.sessions = new Map([['s1', { mode: 'claude' }]]);
@@ -117,10 +108,12 @@ describe('response viewer brief view (last answered turn)', () => {
   }
 
   afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
     document.body.innerHTML = '';
   });
 
-  it('asks for context=turn and renders the whole turn as one badged card with segments', async () => {
+  it('opens the full history and renders a turn as one badged card with segments', async () => {
     const { body, viewer } = mountViewer();
     const { app, fetchMock } = makeApp({
       text: 'Done.',
@@ -134,7 +127,7 @@ describe('response viewer brief view (last answered turn)', () => {
 
     await app.toggleResponseViewer();
 
-    expect(String(fetchMock.mock.calls[0][0])).toBe('/api/sessions/s1/last-response?context=turn');
+    expect(String(fetchMock.mock.calls[0][0])).toBe('/api/sessions/s1/last-response?context=full');
     const cards = body.querySelectorAll('.rv-message');
     expect(cards).toHaveLength(3);
     expect(body.querySelectorAll('.rv-role')).toHaveLength(1);
@@ -145,7 +138,7 @@ describe('response viewer brief view (last answered turn)', () => {
     expect(viewer.classList.contains('visible')).toBe(true);
   });
 
-  it('opens a multi-row turn at its NEWEST text, and a single card at the top', async () => {
+  it('opens history at its newest text', async () => {
     // `body.scrollTop = 0` was right when the brief view was one card holding
     // the last row. With the whole turn rendered, the top of the scroller is
     // the turn's FIRST narration line and the answer the eye button exists to
@@ -183,7 +176,7 @@ describe('response viewer brief view (last answered turn)', () => {
       timestamp: 't',
       messages: [{ role: 'assistant', text: 'Done.', turn: 2 }],
     }).app.toggleResponseViewer();
-    expect(oneWrites.at(-1)).toBe(0);
+    expect(oneWrites.at(-1)).toBe(4200);
   });
 
   it('falls back to text when the server sends no messages, keeping one badged card', async () => {
@@ -197,7 +190,7 @@ describe('response viewer brief view (last answered turn)', () => {
     expect(body.textContent).toContain('Only the last row.');
   });
 
-  it('ignores user rows and blank rows in a turn payload', async () => {
+  it('includes human prompts and ignores blank rows in history', async () => {
     const { body } = mountViewer();
     const { app } = makeApp({
       text: 'answer',
@@ -211,8 +204,84 @@ describe('response viewer brief view (last answered turn)', () => {
 
     await app.toggleResponseViewer();
 
-    expect(body.querySelectorAll('.rv-message')).toHaveLength(1);
-    expect(body.textContent).not.toContain('prompt');
+    expect(body.querySelectorAll('.rv-message')).toHaveLength(2);
+    expect(body.textContent).toContain('prompt');
     expect(body.textContent).toContain('answer');
+  });
+
+  it('appends new replies without duplicating history or moving a reader who scrolled up', async () => {
+    const { body } = mountViewer();
+    const messages = [
+      { role: 'user', text: 'old question', turn: 1 },
+      { role: 'assistant', text: 'important intermediate result', turn: 1 },
+    ];
+    const { app, fetchMock } = makeApp({ messages });
+    await app.toggleResponseViewer();
+    const first = body.firstElementChild;
+    Object.defineProperty(body, 'scrollHeight', { get: () => 3000 });
+    Object.defineProperty(body, 'clientHeight', { get: () => 500 });
+    body.scrollTop = 200;
+    fetchMock.mockResolvedValue({
+      json: async () => ({ data: { messages: [...messages, { role: 'assistant', text: 'final answer', turn: 1 }] } }),
+    });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(body.querySelectorAll('.rv-message')).toHaveLength(3);
+    expect(body.firstElementChild).toBe(first);
+    expect(body.scrollTop).toBe(200);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(body.querySelectorAll('.rv-message')).toHaveLength(3);
+    await app.toggleResponseViewer();
+    const count = fetchMock.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(fetchMock).toHaveBeenCalledTimes(count);
+  });
+
+  it('never substitutes a raw terminal dump when a resumed transcript is temporarily missing', async () => {
+    const { body } = mountViewer();
+    const { app, fetchMock } = makeApp({ messages: [], text: '' });
+    await app.toggleResponseViewer();
+    expect(body.textContent).toContain('Waiting for the transcript');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fetchMock.mockResolvedValue({
+      json: async () => ({ data: { messages: [{ role: 'assistant', text: 'Recovered history', turn: 1 }] } }),
+    });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(body.textContent).toContain('Recovered history');
+    expect(body.textContent).not.toContain('Waiting for the transcript');
+  });
+
+  it('does not reopen a closed overlay when an in-flight history request finishes', async () => {
+    const { body, viewer } = mountViewer();
+    const { app, fetchMock } = makeApp({ messages: [] });
+    let finish!: (value: unknown) => void;
+    fetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    const opening = app.toggleResponseViewer();
+    await app.toggleResponseViewer();
+    finish({ json: async () => ({ data: { messages: [{ role: 'assistant', text: 'late reply' }] } }) });
+    await opening;
+    expect(viewer.classList.contains('visible')).toBe(false);
+    expect(body.textContent).not.toContain('late reply');
+  });
+
+  it('does not render a late response from a different tab', async () => {
+    const { body } = mountViewer();
+    const { app, fetchMock } = makeApp({ messages: [] });
+    let finish!: (value: unknown) => void;
+    fetchMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    const opening = app.toggleResponseViewer();
+    app.activeSessionId = 'other';
+    finish({ json: async () => ({ data: { messages: [{ role: 'assistant', text: 'wrong conversation' }] } }) });
+    await opening;
+    expect(body.textContent).not.toContain('wrong conversation');
   });
 });

@@ -66,6 +66,7 @@ const HOME_SESSIONS_PILL_LABEL = {
   error: 'error',
   waiting: 'waiting',
   working: 'working',
+  workflow: 'workflow',
   idle: 'idle',
   done: 'done',
 };
@@ -199,6 +200,7 @@ Object.assign(CodemanApp.prototype, {
       const state = this._mobileOverviewState(session, this.pendingHooks?.get(id));
       // Guarded: a stale cached mobile-overview.js may predate the helper.
       const exit = this._mobileOverviewExit ? this._mobileOverviewExit(state, session) : null;
+      const since = exit ? exit.since : this._mobileOverviewSince(state, session);
       const mode = session.mode || 'claude';
       return {
         id,
@@ -225,7 +227,8 @@ Object.assign(CodemanApp.prototype, {
         lastSubmitAt: Number(session.lastSubmitAt) || 0,
         // "how long has it been like this", resolved by the phone overview's
         // helper so both home screens label the same stamp with the same word.
-        since: exit ? exit.since : this._mobileOverviewSince(state, session),
+        since,
+        workflowStartedAt: state === 'workflow' ? since?.at || 0 : 0,
       };
     });
 

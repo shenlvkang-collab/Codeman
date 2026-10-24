@@ -175,6 +175,7 @@ Object.assign(CodemanApp.prototype, {
 
     // Find which Codeman session owns this subagent (direct claudeSessionId match only)
     this.findParentSessionForSubagent(data.agentId);
+    this.renderSessionTabs();
 
     // Subagent windows are no longer auto-opened on discovery.
     // Users can open them manually from the monitor panel or via openAllActiveSubagentWindows().
@@ -199,6 +200,7 @@ Object.assign(CodemanApp.prototype, {
       this.subagents.set(data.agentId, data);
     }
     this.renderSubagentPanel();
+    this.renderSessionTabs();
     // Update floating window if open (content + header/title)
     if (this.subagentWindows.has(data.agentId)) {
       this.renderSubagentWindowContent(data.agentId);
@@ -271,6 +273,7 @@ Object.assign(CodemanApp.prototype, {
       this.subagents.set(data.agentId, existing);
     }
     this.renderSubagentPanel();
+    this.renderSessionTabs();
     this.updateSubagentWindows();
 
     // Auto-minimize completed subagent windows

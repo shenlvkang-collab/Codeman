@@ -870,12 +870,13 @@ const SESSION_ACTIVITY_RANK = {
   error: 1,
   waiting: 2,
   working: 3,
-  idle: 4,
-  done: 5,
+  workflow: 4,
+  idle: 5,
+  done: 6,
 };
 
 /** States still in progress, where the OLDEST stamp sorts first. */
-const SESSION_ACTIVITY_OLDEST_FIRST = ['needs', 'error', 'waiting', 'working'];
+const SESSION_ACTIVITY_OLDEST_FIRST = ['needs', 'error', 'waiting', 'working', 'workflow'];
 
 /**
  * When the row entered the state it is in.
@@ -895,6 +896,7 @@ const SESSION_ACTIVITY_OLDEST_FIRST = ['needs', 'error', 'waiting', 'working'];
 function sessionActivityAnchor(row) {
   const activeAt = Number(row && row.lastActivityAt) || 0;
   if (row && row.state === 'working') return Number(row.lastSubmitAt) || activeAt;
+  if (row && row.state === 'workflow') return Number(row.workflowStartedAt) || activeAt;
   return activeAt;
 }
 
@@ -972,6 +974,7 @@ const TAB_TRIAGE_GROUP_OF_STATE = {
   error: 'needs',
   waiting: 'waiting',
   working: 'working',
+  workflow: 'working',
   idle: 'idle',
   done: 'idle',
 };

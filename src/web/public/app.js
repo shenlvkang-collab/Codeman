@@ -5045,6 +5045,7 @@ class CodemanApp {
         this.subagents.set(s.agentId, s);
       });
       this.renderSubagentPanel();
+      this.renderSessionTabs();
 
       // Load PERSISTENT parent associations FIRST, before restoring windows
       // This ensures connection lines are drawn to the correct tabs
@@ -5355,6 +5356,7 @@ class CodemanApp {
       rows.push({
         id: ids[i],
         state: this._mobileOverviewState(session, this.pendingHooks?.get(ids[i])),
+        workflowStartedAt: this._sessionWorkflowActivity?.(session)?.at || 0,
         lastActivityAt: Number(session.lastActivityAt) || 0,
         lastSubmitAt: Number(session.lastSubmitAt) || 0,
         orderIndex: i,
@@ -6138,6 +6140,7 @@ class CodemanApp {
       error: 'error',
       waiting: 'waiting',
       working: 'working',
+      workflow: 'workflow',
       idle: 'idle',
       done: 'done',
     }[state] || state;

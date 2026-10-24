@@ -93,6 +93,7 @@ const MOBILE_OVERVIEW_PILL_LABEL = {
   error: 'error',
   waiting: 'waiting',
   working: 'working',
+  workflow: 'workflow',
   idle: 'idle',
   done: 'done',
 };
@@ -107,6 +108,7 @@ const MOBILE_OVERVIEW_SINCE_LABEL = {
   waiting: 'waiting',
   error: 'failed',
   working: 'working',
+  workflow: 'workflow',
   idle: 'idle',
   done: 'ended',
 };
@@ -126,15 +128,39 @@ Object.assign(CodemanApp.prototype, {
    * the hook is the newer signal.
    * @param {object} session session state from this.sessions
    * @param {Set<string>|undefined} hooks pending hook types for that session
-   * @returns {'needs'|'error'|'waiting'|'working'|'idle'|'done'}
+   * @returns {'needs'|'error'|'waiting'|'working'|'workflow'|'idle'|'done'}
    */
-  _mobileOverviewState(session, hooks) {
+  _mobileOverviewState(session, hooks, subagents = this.subagents) {
     if (hooks && (hooks.has('permission_prompt') || hooks.has('elicitation_dialog'))) return 'needs';
     if (session.status === 'error') return 'error';
+    if (
+      session.status !== 'stopped' &&
+      !session.paneExit &&
+      (session.status !== 'busy' || hooks?.has('idle_prompt')) &&
+      this._sessionWorkflowActivity(session, subagents)
+    )
+      return 'workflow';
     if (hooks && hooks.has('idle_prompt')) return 'waiting';
     if (session.status === 'busy') return 'working';
     if (session.status === 'stopped') return 'done';
     return 'idle';
+  },
+
+  /** Unfinished children owned by recorded conversation IDs, never window-placement fallbacks. */
+  _sessionWorkflowActivity(session, subagents = this.subagents) {
+    const conversations = new Set(session.claudeSessionChain || []);
+    if (session.claudeSessionId) conversations.add(session.claudeSessionId);
+    let at = 0;
+    let found = false;
+    for (const agent of subagents?.values?.() || []) {
+      if (!agent.sessionId || !conversations.has(agent.sessionId)) continue;
+      // Watcher 'idle' means no recent transcript writes; completion is a separate signal.
+      if (agent.status !== 'active' && agent.status !== 'idle') continue;
+      found = true;
+      const started = Date.parse(agent.startedAt) || Number(agent.lastActivityAt) || 0;
+      if (started > 0 && (!at || started < at)) at = started;
+    }
+    return found ? { at: at || Number(session.lastSubmitAt) || Number(session.lastActivityAt) || 0 } : null;
   },
 
   /**
@@ -155,7 +181,11 @@ Object.assign(CodemanApp.prototype, {
    *
    * @returns {{key: string, at: number}|null}
    */
-  _mobileOverviewSince(state, session) {
+  _mobileOverviewSince(state, session, subagents = this.subagents) {
+    if (state === 'workflow') {
+      const activity = this._sessionWorkflowActivity(session, subagents);
+      return activity?.at ? { key: 'workflow', at: activity.at } : null;
+    }
     const activeAt = Number(session.lastActivityAt) || 0;
     const at = state === 'working' ? Number(session.lastSubmitAt) || activeAt : activeAt;
     if (!at) return null;
@@ -220,6 +250,7 @@ Object.assign(CodemanApp.prototype, {
    * @param {Array} input.cases case list (this.cases)
    * @param {Array<string>} [input.sessionOrder] the user's tab order, used as the tiebreak
    * @param {Map<string, Set<string>>} [input.pendingHooks] this.pendingHooks
+   * @param {Map<string, object>|Array} [input.subagents] tracked subagent snapshot
    * @param {Array} [input.history] unified session items (GET /api/sessions/unified)
    * @returns {{needsYou: Array, current: Array, past: Array, sessionCount: number}}
    */
@@ -227,13 +258,15 @@ Object.assign(CodemanApp.prototype, {
     const cases = Array.isArray(input && input.cases) ? input.cases : [];
     const order = Array.isArray(input && input.sessionOrder) ? input.sessionOrder : [];
     const pendingHooks = (input && input.pendingHooks) || new Map();
+    const subagents = input?.subagents || [];
     const raw = (input && input.sessions) || [];
     const sessions = typeof raw.values === 'function' ? Array.from(raw.values()) : Array.from(raw);
 
     const rows = sessions.map((session) => {
       const matched = this._mobileOverviewCaseFor(session.workingDir, cases);
-      const state = this._mobileOverviewState(session, pendingHooks.get && pendingHooks.get(session.id));
+      const state = this._mobileOverviewState(session, pendingHooks.get && pendingHooks.get(session.id), subagents);
       const exit = this._mobileOverviewExit(state, session);
+      const since = exit ? exit.since : this._mobileOverviewSince(state, session, subagents);
       const orderIndex = order.indexOf(session.id);
       return {
         id: session.id,
@@ -257,7 +290,8 @@ Object.assign(CodemanApp.prototype, {
         // pair resolved for DISPLAY, and the two must not drift apart.
         lastActivityAt: Number(session.lastActivityAt) || 0,
         lastSubmitAt: Number(session.lastSubmitAt) || 0,
-        since: exit ? exit.since : this._mobileOverviewSince(state, session),
+        since,
+        workflowStartedAt: state === 'workflow' ? since?.at || 0 : 0,
         orderIndex: orderIndex === -1 ? Number.MAX_SAFE_INTEGER : orderIndex,
       };
     });
@@ -307,7 +341,7 @@ Object.assign(CodemanApp.prototype, {
 
     return {
       needsYou: inSection(['needs', 'error', 'waiting']),
-      current: inSection(['working', 'idle', 'done']),
+      current: inSection(['working', 'workflow', 'idle', 'done']),
       past,
       sessionCount: rows.length,
     };
@@ -481,6 +515,7 @@ Object.assign(CodemanApp.prototype, {
       cases: this.cases,
       sessionOrder: this.sessionOrder,
       pendingHooks: this.pendingHooks,
+      subagents: this.subagents,
       history: this._mobileOverviewHistory,
     });
     // Resume needs the workingDir/claudeSessionId off the row the user tapped.

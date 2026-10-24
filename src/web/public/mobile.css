@@ -2963,6 +2963,7 @@ html.mobile-init .file-browser-panel {
   /* Working is not an alert, so it gets a calm green breathing edge rather than a
      blink: at a glance the row reads "this one is moving", without competing with
      the two states that actually want you. Slower than both of them on purpose. */
+  .mobile-overview-row--workflow,
   .mobile-overview-row--working {
     border-color: var(--green);
     animation: mobile-overview-breathe-green 2.2s ease-in-out infinite;
@@ -2982,6 +2983,7 @@ html.mobile-init .file-browser-panel {
 
   /* The pill picks up a three-dot ellipsis that fills in and empties, so the row
      still reads as active on a skin where the border tint is subtle. */
+  .mobile-overview-pill--workflow::after,
   .mobile-overview-pill--working::after {
     content: '';
     display: inline-block;
@@ -3096,6 +3098,7 @@ html.mobile-init .file-browser-panel {
   /* The freshest signal on the row: while a session is actually running, how
      long the current turn has been going is the number the eye should land on.
      Same treatment the desktop rail gives its "active" stamp. */
+  .mobile-overview-row--workflow .mobile-overview-meta-since,
   .mobile-overview-row--working .mobile-overview-meta-since {
     color: var(--green);
     opacity: 0.95;
@@ -3122,6 +3125,7 @@ html.mobile-init .file-browser-panel {
      shared `pulse` keyframes while it is working. The halo matches the busy tab
      dot and the desktop home column (.home-sessions-dot--working, styles.css):
      working reads identically on every surface or it reads as three features. */
+  .mobile-overview-dot--workflow,
   .mobile-overview-dot--working {
     background: var(--green);
     animation: pulse 1.5s infinite;
@@ -3138,6 +3142,7 @@ html.mobile-init .file-browser-panel {
     position: relative;
   }
 
+  .mobile-overview-dot--workflow::after,
   .mobile-overview-dot--working::after {
     content: '';
     position: absolute;
@@ -3183,6 +3188,7 @@ html.mobile-init .file-browser-panel {
   }
 
   .mobile-overview-pill--idle,
+  .mobile-overview-pill--workflow,
   .mobile-overview-pill--working {
     border-color: var(--green);
     color: var(--green);
@@ -3269,12 +3275,14 @@ html.mobile-init .file-browser-panel {
     background: rgba(234, 179, 8, 0.12);
   }
 
+  .mobile-overview-dot--workflow,
   .mobile-overview-dot--working {
     animation: none;
   }
 
   /* The ring stays as a static full circle: it still marks the row, it just
      stops turning. */
+  .mobile-overview-dot--workflow::after,
   .mobile-overview-dot--working::after {
     border-color: var(--green);
     animation: none;
@@ -3282,10 +3290,12 @@ html.mobile-init .file-browser-panel {
 
   /* Working is only informational, so it drops to a static green edge and a
      static ellipsis rather than holding a tint the way the alerts do. */
+  .mobile-overview-row--workflow,
   .mobile-overview-row--working {
     animation: none;
   }
 
+  .mobile-overview-pill--workflow::after,
   .mobile-overview-pill--working::after {
     content: '...';
     animation: none;
